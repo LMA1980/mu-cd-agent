@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use muconde_ipc::DeploymentSlot;
+use mu_cd_ipc::DeploymentSlot;
 
 use crate::btrfs::{validate_service_name, CommandRunner};
 use crate::error::AgentError;

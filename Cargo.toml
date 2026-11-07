@@ -1,16 +1,14 @@
 [package]
-name = "muconde-agent"
+name = "mu-cd-agent"
 version = "0.1.0"
 edition = "2021"
 description = "Node-level continuous delivery daemon executing atomic filesystem operations, dual A/B root subvolume switching, health probes, and autonomous watchdog rollbacks"
 license = "AGPL-3.0-only"
-repository = "https://github.com/LMA1980/MuConDe-agent"
+repository = "https://github.com/LMA1980/mu-cd-agent"
 
 [dependencies]
-# TEMPORARY: pinned to the ipc feature branch until LMA1980/MuConDe-ipc#21 merges.
-# Switch back to `branch = "main"` and run `cargo update -p muconde-ipc` afterwards.
-muconde-ipc = { git = "https://github.com/LMA1980/MuConDe-ipc.git", branch = "feat/integration-test-progress" }
-muobserve-ipc = { git = "https://github.com/LMA1980/MuObserve-ipc.git" }
+mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "feat/m8-naming-alignment" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "feat/m8-naming-alignment" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
 tokio-rustls = "0.26"
 rustls = "0.23"

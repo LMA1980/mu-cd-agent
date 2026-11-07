@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use muconde_ipc::{
+use mu_cd_ipc::{
     ArtifactTaintNotification, DeploymentSlot, HealthProbeTelemetry, IntegrationTestReport,
     RollbackCommand, SlotSwapCommand,
 };

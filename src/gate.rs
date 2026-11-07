@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use muconde_ipc::{IntegrationTestProgress, TestState};
+use mu_cd_ipc::{IntegrationTestProgress, TestState};
 
 use crate::watchdog::now_epoch_ms;
 

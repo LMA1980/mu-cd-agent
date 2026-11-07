@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use muconde_ipc::{DeploymentSlot, StageDeploymentRequest, StageDeploymentResponse};
+use mu_cd_ipc::{DeploymentSlot, StageDeploymentRequest, StageDeploymentResponse};
 
 use crate::error::AgentError;
 

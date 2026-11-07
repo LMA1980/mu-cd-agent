@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use muconde_agent::{
+use mu_cd_agent::{
     builtin_catalog, IntegrationTestSelection, MuConDeAgent, MuConDeAgentConfig,
     SystemCommandRunner, SystemHealthProber,
 };
@@ -16,11 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,muconde_agent=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,mu_cd_agent=debug")),
         )
         .init();
 
-    tracing::info!("Starting MuConDe-agent v{}", muconde_agent::agent_version());
+    tracing::info!("Starting mu-cd-agent v{}", mu_cd_agent::agent_version());
 
     let node_id = std::env::var("MUCONDE_NODE_ID").unwrap_or_else(|_| "worker-node".into());
     let listen_addr =

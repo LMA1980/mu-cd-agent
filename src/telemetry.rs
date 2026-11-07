@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use muobserve_ipc::{
+use mu_observable_ipc::{
     encode_metric_batch, encode_span_batch, write_frame, DeterministicSecretRedactor, IpcHeader,
     OtelMetricEntry, OtelSpanEntry, TraceContext, MSG_TYPE_ARROW_OTEL_METRICS,
     MSG_TYPE_ARROW_OTEL_SPANS,
@@ -194,7 +194,7 @@ pub fn trace_context_for_deployment(deployment_id: &str, step_seed: u64) -> Trac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{decode_metric_batch, decode_span_batch, read_frame};
+    use mu_observable_ipc::{decode_metric_batch, decode_span_batch, read_frame};
     use tokio::net::TcpListener;
 
     #[tokio::test]

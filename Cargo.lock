@@ -798,13 +798,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "muconde-agent"
+name = "mu-cd-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "fory",
- "muconde-ipc",
- "muobserve-ipc",
+ "mu-cd-ipc",
+ "mu-observable-ipc",
  "rcgen",
  "rustls",
  "rustls-pki-types",
@@ -821,9 +821,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "muconde-ipc"
+name = "mu-cd-ipc"
 version = "0.2.0"
-source = "git+https://github.com/LMA1980/MuConDe-ipc.git?branch=feat%2Fintegration-test-progress#6c46b25867f5b08fb6f96d88a7e7649016fba960"
+source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=feat%2Fm8-naming-alignment#ec3e0aee1c7635801dc004dac5fdfcc890e85ea9"
 dependencies = [
  "bytes",
  "fory",
@@ -835,9 +835,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "muobserve-ipc"
+name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/MuObserve-ipc.git#72476e02a6dc873a7a9122a7f4f55cf91ac88836"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=feat%2Fm8-naming-alignment#28793ce66732461cb68c3aef3006154939265abb"
 dependencies = [
  "arrow",
  "bytes",
