@@ -807,6 +807,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_agent_stage_deployment_request_over_duplex() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -865,6 +866,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_agent_slot_swap_and_telemetry_over_duplex() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -940,6 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_agent_heartbeat_over_duplex() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -1043,6 +1046,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_gate_emits_pending_running_passed_on_healthy_warmup() {
         use crate::gate::{TEST_HEALTH_ENDPOINT_READY, TEST_SYSTEMD_UNIT_ACTIVE};
         use mu_cd_ipc::TestState;
@@ -1097,6 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_gate_reports_failed_critical_test_then_final_report_and_taint() {
         use crate::gate::{TEST_HEALTH_ENDPOINT_READY, TEST_SYSTEMD_UNIT_ACTIVE};
         use mu_cd_ipc::TestState;
@@ -1152,6 +1157,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_gate_honours_selected_integration_tests() {
         use crate::gate::{IntegrationTestSelection, TEST_HEALTH_ENDPOINT_READY};
 
@@ -1180,6 +1186,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_send_it_progress_is_best_effort_on_closed_stream() {
         let fory = create_fory_runtime().unwrap();
         let (client, mut server) = tokio::io::duplex(1024);
@@ -1190,6 +1197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_build_tls_server_config() {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
@@ -1225,6 +1233,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_agent_rollback_command_over_duplex() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -1301,6 +1310,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_agent_emits_otel_spans_and_metrics_for_staging_swap_probes_and_rollback() {
         use crate::telemetry::RecordingTelemetrySink;
 

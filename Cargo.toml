@@ -7,8 +7,8 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/mu-cd-agent"
 
 [dependencies]
-mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "feat/m8-naming-alignment" }
-mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "feat/m8-naming-alignment" }
+mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
 tokio-rustls = "0.26"
 rustls = "0.23"

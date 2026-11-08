@@ -198,6 +198,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_collector_sink_streams_muob_arrow_batches_and_gracefully_handles_unreachable() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
