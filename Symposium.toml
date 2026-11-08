@@ -1,0 +1,10 @@
+name = "mu-cd-agent"
+# Crate-embedded Symposium manifest for mu-cd-agent.
+
+[[plugins]]
+depends-on = ["mu-cd-ipc"]
+source.cargo = "mu-cd-ipc"
+
+[[plugins]]
+depends-on = ["mu-observable-ipc"]
+source.cargo = "mu-observable-ipc"

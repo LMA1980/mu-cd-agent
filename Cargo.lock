@@ -467,7 +467,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -798,13 +798,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "muconde-agent"
+name = "mu-cd-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "fory",
- "muconde-ipc",
- "muobserve-ipc",
+ "mu-cd-ipc",
+ "mu-observable-ipc",
  "rcgen",
  "rustls",
  "rustls-pki-types",
@@ -821,9 +821,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "muconde-ipc"
+name = "mu-cd-ipc"
 version = "0.2.0"
-source = "git+https://github.com/LMA1980/MuConDe-ipc.git?branch=feat%2Fintegration-test-progress#6c46b25867f5b08fb6f96d88a7e7649016fba960"
+source = "git+https://github.com/LMA1980/mu-cd-ipc.git#3335a306e6e9deae404aab0edb07900d0979cbdf"
 dependencies = [
  "bytes",
  "fory",
@@ -835,9 +835,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "muobserve-ipc"
+name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/MuObserve-ipc.git#72476e02a6dc873a7a9122a7f4f55cf91ac88836"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git#8ae17bcca3ddbd3566e40f1b364afd487306f80c"
 dependencies = [
  "arrow",
  "bytes",
@@ -1142,7 +1142,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1349,7 +1349,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

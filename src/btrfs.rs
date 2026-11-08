@@ -7,19 +7,29 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use muconde_ipc::{DeploymentSlot, StageDeploymentRequest, StageDeploymentResponse};
+use mu_cd_ipc::{DeploymentSlot, StageDeploymentRequest, StageDeploymentResponse};
 
 use crate::error::AgentError;
 
-/// Permitted platform service binaries managed by MuConDe-agent.
+/// Permitted platform service binaries managed by `mu-cd-agent`.
 ///
 /// Strictly scoped to platform application binaries — never the full host OS rootfs.
+/// Retains legacy pre-M8 service names alongside M8-aligned names during 3-phase transition.
 pub const ALLOWED_SERVICES: &[&str] = &[
     "action-runner",
     "action-runner-controller",
     "muregist",
     "muconde-agent",
     "model-runner",
+    "mu-ci-worker",
+    "mu-ci-controller",
+    "mu-registry",
+    "mu-cd-agent",
+    "mu-cd-controller",
+    "mu-observable-hub",
+    "mu-observable-collector",
+    "mu-observable-sentinel",
+    "jero-runner",
 ];
 
 /// Validates a service name against path-traversal patterns and the platform allowlist.
@@ -177,7 +187,8 @@ impl CommandRunner for MockCommandRunner {
                     let _ = fs::create_dir_all(parent);
                 }
                 if src.exists() {
-                    fs::copy(src, dest).map_err(AgentError::Io)?;
+                    let bytes = fs::read(src).map_err(AgentError::Io)?;
+                    fs::write(dest, bytes).map_err(AgentError::Io)?;
                 } else {
                     fs::write(dest, b"#!/bin/sh\necho mock\n").map_err(AgentError::Io)?;
                 }
@@ -355,6 +366,15 @@ mod tests {
         assert!(validate_service_name("muregist").is_ok());
         assert!(validate_service_name("muconde-agent").is_ok());
         assert!(validate_service_name("model-runner").is_ok());
+        assert!(validate_service_name("mu-ci-worker").is_ok());
+        assert!(validate_service_name("mu-ci-controller").is_ok());
+        assert!(validate_service_name("mu-registry").is_ok());
+        assert!(validate_service_name("mu-cd-agent").is_ok());
+        assert!(validate_service_name("mu-cd-controller").is_ok());
+        assert!(validate_service_name("mu-observable-hub").is_ok());
+        assert!(validate_service_name("mu-observable-collector").is_ok());
+        assert!(validate_service_name("mu-observable-sentinel").is_ok());
+        assert!(validate_service_name("jero-runner").is_ok());
 
         // Path traversal attempts
         assert!(matches!(

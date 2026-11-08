@@ -27,7 +27,7 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
 
     #[error("IPC error: {0}")]
-    Ipc(#[from] muconde_ipc::IpcError),
+    Ipc(#[from] mu_cd_ipc::IpcError),
 
     #[error("Serialization / Fory error: {0}")]
     Serialization(String),

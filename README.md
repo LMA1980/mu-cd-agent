@@ -1,16 +1,16 @@
-# MuConDe-agent
+# mu-cd-agent
 
 <p align="center">
   <a href="https://hook.lma1980.duckdns.org/jobs">
-    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/MuConDe-agent/card.svg" alt="MuConDe-agent Factory Scorecard" width="520"/>
+    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/mu-cd-agent/card.svg" alt="mu-cd-agent Factory Scorecard" width="520"/>
   </a>
 </p>
 
 <p align="center">
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-agent/status.svg" alt="CI Status"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-agent/score.svg" alt="Quality Score"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-agent/coverage.svg" alt="Coverage"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-agent/benchmark.svg" alt="Benchmark"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-agent/status.svg" alt="CI Status"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-agent/score.svg" alt="Quality Score"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-agent/coverage.svg" alt="Coverage"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-agent/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
 ---
@@ -31,7 +31,7 @@ Resident systemd daemon operating natively across heterogeneous cluster nodes: S
   - Creates pre-deployment rollback anchor snapshots prior to stage mutation.
 - **Local Health Probes & Watchdogs**:
   - Executes local HTTP, TCP, and systemd unit readiness probes against the staged service in Slot B.
-  - Streams real-time probe telemetry to `MuConDe-controller` over `MuConDe-ipc`.
+  - Streams real-time probe telemetry to `mu-cd-controller` over `mu-cd-ipc`.
 - **Autonomous Rollback Watchdog**:
   - Enforces local hardware and software lease watchdogs.
   - If controller heartbeat or lease renewal drops during an in-flight deployment, the agent autonomously reverts the active subvolume and restarts production services in < 1 second.
@@ -55,14 +55,14 @@ Resident systemd daemon operating natively across heterogeneous cluster nodes: S
 
 ```text
 [ Controller Commands ] ──> Lease (TTL: 300s)
-                               │
-               ┌───────────────┴───────────────┐
-               ▼                               ▼
-       [ Health Probes Pass ]          [ Health Probe Fail OR Lease Expired ]
-               │                               │
-               ▼                               ▼
-     Atomic Promotion Swap           Autonomous Btrfs Snapshot Rollback
-  (@root_b promoted to active)      (Revert to @root_a_snap_<timestamp>)
+                                │
+                ┌───────────────┴───────────────┐
+                ▼                               ▼
+        [ Health Probes Pass ]          [ Health Probe Fail OR Lease Expired ]
+                │                               │
+                ▼                               ▼
+      Atomic Promotion Swap           Autonomous Btrfs Snapshot Rollback
+   (@root_b promoted to active)      (Revert to @root_a_snap_<timestamp>)
 ```
 
 ---
@@ -70,7 +70,7 @@ Resident systemd daemon operating natively across heterogeneous cluster nodes: S
 ## Integration-Gate Progress (`IntegrationTestProgress`)
 
 After every `SlotSwapCommand` the agent streams per-test progress on the same connection
-(`MSG_TYPE_IT_PROGRESS = 0x0C`, `muconde-ipc` 0.2.0) so the controller and MuConsole can show
+(`MSG_TYPE_IT_PROGRESS = 0x0C`, `mu-cd-ipc` 0.2.0) so the controller and MuConsole can show
 the gate live:
 
 1. `Pending` for every test in the gate (the contract's `integration_tests`, with `"all"` expanded

@@ -1,4 +1,4 @@
-//! MuConDe-agent: Node-level continuous delivery daemon executing atomic
+//! mu-cd-agent: Node-level continuous delivery daemon executing atomic
 //! filesystem operations, dual A/B root subvolume switching, health probes,
 //! and autonomous watchdog rollbacks.
 

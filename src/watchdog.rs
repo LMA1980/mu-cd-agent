@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use muconde_ipc::{
+use mu_cd_ipc::{
     ArtifactTaintNotification, DeploymentSlot, HealthProbeTelemetry, IntegrationTestReport,
     RollbackCommand, SlotSwapCommand,
 };
@@ -470,6 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_healthy_warmup_satisfies_criteria() {
         let service = "action-runner";
         let (_temp, slot_mgr, _runner) = setup_env(service);
@@ -527,6 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_unhealthy_probe_triggers_immediate_subsecond_rollback() {
         let service = "muregist";
         let (_temp, slot_mgr, _runner) = setup_env(service);
@@ -587,6 +589,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_lease_ttl_expiry_triggers_rollback() {
         let service = "model-runner";
         let (_temp, slot_mgr, _runner) = setup_env(service);
