@@ -17,10 +17,21 @@ use crate::error::AgentError;
 /// Retains legacy pre-M8 service names alongside M8-aligned names during 3-phase transition.
 pub const ALLOWED_SERVICES: &[&str] = &[
     "action-runner",
+    "action-runner-worker",
     "action-runner-controller",
+    "action-runner-web",
+    "muconsole",
+    "mu-console",
+    "mu-ci-web",
     "muregist",
     "muconde-agent",
+    "muconde-controller",
+    "muobserve",
+    "muobserve-collector",
+    "muobserve-sentinel",
     "model-runner",
+    "k3-manager",
+    "jero-manager",
     "mu-ci-worker",
     "mu-ci-controller",
     "mu-registry",
@@ -31,6 +42,40 @@ pub const ALLOWED_SERVICES: &[&str] = &[
     "mu-observable-sentinel",
     "jero-runner",
 ];
+
+/// Returns `true` when `service` refers to a static web frontend bundle served by Nginx.
+pub fn is_static_web_service(service: &str) -> bool {
+    matches!(
+        service,
+        "muconsole" | "mu-console" | "action-runner-web" | "mu-ci-web"
+    )
+}
+
+/// Maps a logical or M8-aligned service name to candidate host binary names under `/usr/local/bin`.
+pub fn candidate_binary_names(service: &str) -> &'static [&'static str] {
+    match service {
+        "action-runner" | "action-runner-worker" | "mu-ci-worker" => {
+            &["mu-ci-worker", "action-runner"]
+        }
+        "action-runner-controller" | "mu-ci-controller" => {
+            &["action-runner-controller", "mu-ci-controller"]
+        }
+        "muregist" | "mu-registry" => &["muregist", "mu-registry"],
+        "muconde-agent" | "mu-cd-agent" => &["mu-cd-agent", "muconde-agent"],
+        "muconde-controller" | "mu-cd-controller" => &["mu-cd-controller", "muconde-controller"],
+        "muobserve" | "mu-observable-hub" => &["muobservectl", "muobserve", "mu-observable-hub"],
+        "muobserve-collector" | "mu-observable-collector" => {
+            &["muobserve-collector", "mu-observable-collector"]
+        }
+        "muobserve-sentinel" | "mu-observable-sentinel" => {
+            &["muobserve-sentinel", "mu-observable-sentinel"]
+        }
+        "model-runner" | "jero-runner" | "k3-manager" | "jero-manager" => {
+            &["k3-manager", "model-runner", "jero-runner"]
+        }
+        _ => &[],
+    }
+}
 
 /// Validates a service name against path-traversal patterns and the platform allowlist.
 pub fn validate_service_name(service: &str) -> Result<(), AgentError> {
@@ -267,6 +312,13 @@ impl BtrfsManager {
 
         // Only snapshot if slot @a exists (or mock runner simulates it)
         if slot_a.exists() || self.root_dir.is_relative() {
+            if snapshot_dest.exists() {
+                let _ = self.runner.run_command(
+                    "btrfs",
+                    &["subvolume", "delete", snapshot_dest.to_str().unwrap_or("")],
+                );
+                let _ = fs::remove_dir_all(&snapshot_dest);
+            }
             let _ = self.runner.run_command(
                 "btrfs",
                 &[
@@ -285,6 +337,9 @@ impl BtrfsManager {
         let _ = self
             .runner
             .run_command("btrfs", &["subvolume", "delete", slot_b_str]);
+        if slot_b.exists() {
+            let _ = fs::remove_dir_all(&slot_b);
+        }
 
         self.runner
             .run_command("btrfs", &["subvolume", "create", slot_b_str])?;
@@ -307,6 +362,10 @@ impl BtrfsManager {
             fs::set_permissions(&target_binary, perms)?;
         }
 
+        if is_static_web_service(service) && self.root_dir == Path::new("/srv/muconde") {
+            let _ = self.stage_static_web_bundle(service, &slot_b);
+        }
+
         tracing::info!(
             service = service,
             digest = digest,
@@ -315,6 +374,114 @@ impl BtrfsManager {
         );
 
         Ok(target_binary)
+    }
+
+    /// Synchronizes static web frontend assets (`dist/`) from the local Git checkout into `slot_dir/dist`.
+    pub fn stage_static_web_bundle(
+        &self,
+        service: &str,
+        slot_dir: &Path,
+    ) -> Result<(), AgentError> {
+        let repo_candidates: &[&str] = match service {
+            "muconsole" | "mu-console" => &[
+                "/home/lma1980/repository/MuConsole",
+                "/home/lma1980/repository/mu-console",
+                "/var/lib/action-runner/workspace/repos/LMA1980/mu-console",
+            ],
+            "action-runner-web" | "mu-ci-web" => &[
+                "/home/lma1980/repository/ActionRunner-web",
+                "/home/lma1980/repository/mu-ci-web",
+                "/var/lib/action-runner/workspace/repos/LMA1980/mu-ci-web",
+            ],
+            _ => &[],
+        };
+
+        for repo in repo_candidates {
+            let repo_path = Path::new(repo);
+            if repo_path.join(".git").exists() {
+                let _ = self
+                    .runner
+                    .run_command("git", &["-C", repo, "fetch", "origin", "main"]);
+                let _ = self
+                    .runner
+                    .run_command("git", &["-C", repo, "reset", "--hard", "origin/main"]);
+            }
+            let dist_src = repo_path.join("dist");
+            if dist_src.is_dir() {
+                let dist_dest = slot_dir.join("dist");
+                fs::create_dir_all(&dist_dest)?;
+                let src_dot = format!("{}/.", dist_src.display());
+                let _ = self
+                    .runner
+                    .run_command("cp", &["-a", &src_dot, dist_dest.to_str().unwrap_or("")]);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensures that `candidate_path` (`/srv/muconde/staging/<artifact_sha256>`) exists before staging.
+    ///
+    /// If not already present on disk, resolves the artifact from:
+    /// 1. Local `MuRegist` CAS blob store (`/var/lib/muregist/blobs/<sha256>`),
+    /// 2. Shared CI release target directory (`/var/lib/action-runner/workspace/target_shared/release/<bin>`),
+    /// 3. Installed host binary (`/usr/local/bin/<bin>`), or
+    /// 4. Static web bundle stamp when `is_static_web_service(service)` is true.
+    pub fn ensure_candidate_artifact(
+        &self,
+        service: &str,
+        artifact_sha256: &str,
+        candidate_path: &Path,
+    ) -> Result<(), AgentError> {
+        if candidate_path.exists() {
+            return Ok(());
+        }
+        validate_service_name(service)?;
+        if let Some(parent) = candidate_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // 1. Check MuRegist CAS blob
+        let cas_blob = Path::new("/var/lib/muregist/blobs").join(artifact_sha256);
+        if cas_blob.is_file() {
+            fs::copy(&cas_blob, candidate_path)?;
+            let mut perms = fs::metadata(candidate_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(candidate_path, perms)?;
+            return Ok(());
+        }
+
+        // 2. Check static web service
+        if is_static_web_service(service) {
+            let stamp =
+                format!("#!/bin/sh\n# static web bundle {service} {artifact_sha256}\nexit 0\n");
+            fs::write(candidate_path, stamp.as_bytes())?;
+            let mut perms = fs::metadata(candidate_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(candidate_path, perms)?;
+            return Ok(());
+        }
+
+        // 3. Check built release binary or installed /usr/local/bin binary
+        for bin in candidate_binary_names(service) {
+            let candidates = [
+                PathBuf::from(format!(
+                    "/var/lib/action-runner/workspace/target_shared/release/{bin}"
+                )),
+                PathBuf::from(format!("/usr/local/bin/{bin}")),
+            ];
+            for src in candidates {
+                if src.is_file() {
+                    fs::copy(&src, candidate_path)?;
+                    let mut perms = fs::metadata(candidate_path)?.permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(candidate_path, perms)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Handles incoming `StageDeploymentRequest` from `MuConDe-controller`.
@@ -375,6 +542,17 @@ mod tests {
         assert!(validate_service_name("mu-observable-collector").is_ok());
         assert!(validate_service_name("mu-observable-sentinel").is_ok());
         assert!(validate_service_name("jero-runner").is_ok());
+        assert!(validate_service_name("muconsole").is_ok());
+        assert!(validate_service_name("mu-console").is_ok());
+        assert!(validate_service_name("mu-ci-web").is_ok());
+        assert!(validate_service_name("action-runner-web").is_ok());
+        assert!(validate_service_name("muobserve").is_ok());
+        assert!(validate_service_name("muobserve-collector").is_ok());
+        assert!(validate_service_name("muconde-controller").is_ok());
+        assert!(validate_service_name("k3-manager").is_ok());
+        assert!(is_static_web_service("muconsole"));
+        assert!(is_static_web_service("mu-ci-web"));
+        assert!(!is_static_web_service("mu-ci-worker"));
 
         // Path traversal attempts
         assert!(matches!(
