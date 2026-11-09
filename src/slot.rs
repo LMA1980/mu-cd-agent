@@ -132,10 +132,51 @@ impl SlotManager {
             return Err(AgentError::Io(e));
         }
 
-        // 3. Trigger systemctl restart <service> via CommandRunner
-        let restart_arg = service;
-        self.runner
-            .run_command("systemctl", &["restart", restart_arg])?;
+        // 3. On production root (/srv/muconde), activate static web bundle or binary before service restart
+        if self.root_dir == Path::new("/srv/muconde") {
+            let slot_dir = srv_dir.join(target_slot.as_str());
+            if crate::btrfs::is_static_web_service(service) {
+                let web_root = match service {
+                    "muconsole" | "mu-console" => Some("/var/www/muconsole"),
+                    "action-runner-web" | "mu-ci-web" => Some("/var/www/action-runner-web"),
+                    _ => None,
+                };
+                if let Some(dest) = web_root {
+                    let dist_dir = slot_dir.join("dist");
+                    if dist_dir.is_dir() {
+                        let _ = fs::create_dir_all(dest);
+                        let src_dot = format!("{}/.", dist_dir.display());
+                        let _ = self.runner.run_command("cp", &["-a", &src_dot, dest]);
+                    }
+                }
+            } else {
+                let staged_bin = slot_dir.join("bin").join(service);
+                if staged_bin.is_file() {
+                    if let Ok(meta) = fs::metadata(&staged_bin) {
+                        if meta.len() > 1024 {
+                            if let Some(bin_name) =
+                                crate::btrfs::candidate_binary_names(service).first()
+                            {
+                                let dest_bin = format!("/usr/local/bin/{bin_name}");
+                                let _ = self.runner.run_command(
+                                    "install",
+                                    &["-m", "755", staged_bin.to_str().unwrap_or(""), &dest_bin],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Trigger systemctl restart <service> via CommandRunner (skip self-restart of muconde-agent mid-RPC)
+        if !(self.root_dir == Path::new("/srv/muconde")
+            && matches!(service, "muconde-agent" | "mu-cd-agent"))
+        {
+            let restart_arg = service;
+            self.runner
+                .run_command("systemctl", &["restart", restart_arg])?;
+        }
 
         let swapped_at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

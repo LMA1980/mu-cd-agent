@@ -263,6 +263,14 @@ impl MuConDeAgent {
                         .join("staging")
                         .join(&req.artifact_sha256);
 
+                    if self.config.muconde_root == Path::new("/srv/muconde") {
+                        let _ = self.btrfs_manager.ensure_candidate_artifact(
+                            &req.service_name,
+                            &req.artifact_sha256,
+                            &candidate_path,
+                        );
+                    }
+
                     let resp = self.btrfs_manager.handle_stage_deployment_request(
                         &req,
                         &candidate_path,
