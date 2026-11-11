@@ -1,14 +1,14 @@
 [package]
 name = "mu-cd-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Node-level continuous delivery daemon executing atomic filesystem operations, dual A/B root subvolume switching, health probes, and autonomous watchdog rollbacks"
 license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/mu-cd-agent"
 
 [dependencies]
-mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git" }
-mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git" }
+mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "main" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
 tokio-rustls = "0.26"
 rustls = "0.23"
