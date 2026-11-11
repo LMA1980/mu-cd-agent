@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "mu-cd-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "fory",
@@ -822,8 +822,8 @@ dependencies = [
 
 [[package]]
 name = "mu-cd-ipc"
-version = "0.2.0"
-source = "git+https://github.com/LMA1980/mu-cd-ipc.git#3335a306e6e9deae404aab0edb07900d0979cbdf"
+version = "0.2.1"
+source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=main#e9924172a6284b056196a93853826e9a4a78b9b6"
 dependencies = [
  "bytes",
  "fory",
@@ -837,7 +837,7 @@ dependencies = [
 [[package]]
 name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-observable-ipc.git#8ae17bcca3ddbd3566e40f1b364afd487306f80c"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=main#f6755f6aef6d00a6043fe0c842493477ab62aeb4"
 dependencies = [
  "arrow",
  "bytes",
