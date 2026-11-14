@@ -28,6 +28,46 @@ impl Slot {
             Slot::B => "@b",
         }
     }
+
+    /// Returns the opposite deployment slot (`A <-> B`) for symmetric ping-pong alternation.
+    pub const fn other(self) -> Self {
+        match self {
+            Slot::A => Slot::B,
+            Slot::B => Slot::A,
+        }
+    }
+
+    /// Resolves `@a` or `@b` (or a path ending with `/@a` or `/@b`) into a [`Slot`].
+    pub fn from_target_str(target: &str) -> Option<Self> {
+        let trimmed = target.trim_end_matches('/');
+        if trimmed == "@a" || trimmed.ends_with("/@a") {
+            Some(Slot::A)
+        } else if trimmed == "@b" || trimmed.ends_with("/@b") {
+            Some(Slot::B)
+        } else {
+            None
+        }
+    }
+}
+
+/// Resolves the currently active slot from `<service_dir>/current` without validating service allowlists.
+pub(crate) fn read_active_slot_at(service_dir: &Path) -> Result<Option<Slot>, AgentError> {
+    let link_path = service_dir.join("current");
+    if !link_path.is_symlink() && !link_path.exists() {
+        return Ok(None);
+    }
+
+    let target = fs::read_link(&link_path).map_err(AgentError::Io)?;
+    let target_str = target.to_string_lossy();
+    Slot::from_target_str(&target_str)
+        .ok_or_else(|| {
+            AgentError::Slot(format!(
+                "Symlink {} points to unrecognized target: {}",
+                link_path.display(),
+                target_str
+            ))
+        })
+        .map(Some)
 }
 
 impl From<DeploymentSlot> for Slot {
@@ -85,24 +125,62 @@ impl SlotManager {
     /// Reads the currently active slot for the service by inspecting the `current` symlink.
     pub fn read_active_slot(&self, service: &str) -> Result<Option<Slot>, AgentError> {
         validate_service_name(service)?;
-        let link_path = self.current_symlink(service);
-        if !link_path.is_symlink() && !link_path.exists() {
-            return Ok(None);
+        read_active_slot_at(&self.service_dir(service))
+    }
+
+    /// Resolves the candidate target slot for the next deployment: `active.other()` when
+    /// `<svc>/current` is set, or [`Slot::B`] on an uninitialized bootstrap layout.
+    pub fn resolve_target_slot(&self, service: &str) -> Result<Slot, AgentError> {
+        Ok(self
+            .read_active_slot(service)?
+            .map(Slot::other)
+            .unwrap_or(Slot::B))
+    }
+
+    /// Rolls back atomically to `preferred_restore` (or the opposite of `<svc>/current`),
+    /// restoring the target slot from its latest read-only Btrfs snapshot if missing.
+    pub fn rollback_to_prior_slot(
+        &self,
+        service: &str,
+        preferred_restore: Option<Slot>,
+    ) -> Result<SwapReceipt, AgentError> {
+        validate_service_name(service)?;
+        let restore_slot = match preferred_restore {
+            Some(slot) => slot,
+            None => self
+                .read_active_slot(service)?
+                .map(Slot::other)
+                .unwrap_or(Slot::A),
+        };
+
+        let srv_dir = self.service_dir(service);
+        let slot_dir = srv_dir.join(restore_slot.as_str());
+        if !slot_dir.exists() {
+            crate::btrfs::restore_slot_from_latest_snapshot_if_available(
+                &srv_dir,
+                restore_slot,
+                self.runner.as_ref(),
+            )?;
         }
 
-        let target = fs::read_link(&link_path).map_err(AgentError::Io)?;
-        let target_str = target.to_string_lossy();
-        if target_str == "@a" || target_str.ends_with("/@a") {
-            Ok(Some(Slot::A))
-        } else if target_str == "@b" || target_str.ends_with("/@b") {
-            Ok(Some(Slot::B))
-        } else {
-            Err(AgentError::Slot(format!(
-                "Symlink {} points to unrecognized target: {}",
-                link_path.display(),
-                target_str
-            )))
-        }
+        self.atomic_swap_active_slot(service, restore_slot)
+    }
+
+    /// Restores `restore_slot` from the newest read-only snapshot of that slot (or latest
+    /// available snapshot) and atomically switches `<svc>/current` to `restore_slot`.
+    pub fn rollback_restoring_snapshot(
+        &self,
+        service: &str,
+        restore_slot: Slot,
+    ) -> Result<SwapReceipt, AgentError> {
+        validate_service_name(service)?;
+        let srv_dir = self.service_dir(service);
+        crate::btrfs::restore_slot_from_latest_snapshot(
+            &srv_dir,
+            restore_slot,
+            self.runner.as_ref(),
+        )?;
+        self.atomic_swap_active_slot(service, restore_slot)
     }
 
     /// Atomically swaps the active slot pointer (`/srv/muconde/<service>/current`):
@@ -212,6 +290,11 @@ mod tests {
         assert_eq!(DeploymentSlot::from(Slot::B), DeploymentSlot::SlotB);
         assert_eq!(Slot::A.as_str(), "@a");
         assert_eq!(Slot::B.as_str(), "@b");
+        assert_eq!(Slot::A.other(), Slot::B);
+        assert_eq!(Slot::B.other(), Slot::A);
+        assert_eq!(Slot::from_target_str("@a"), Some(Slot::A));
+        assert_eq!(Slot::from_target_str("/srv/muconde/svc/@b/"), Some(Slot::B));
+        assert_eq!(Slot::from_target_str("@c"), None);
     }
 
     #[test]
@@ -285,5 +368,40 @@ mod tests {
             .atomic_swap_active_slot("../evil", Slot::A)
             .unwrap_err();
         assert!(matches!(err, AgentError::PathTraversal(_)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_resolve_target_slot_and_symmetric_rollback() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let service = "mu-cd-agent";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let manager = SlotManager::new(&root, runner);
+
+        // Uninitialized symlink defaults candidate to Slot::B
+        assert_eq!(manager.resolve_target_slot(service).unwrap(), Slot::B);
+
+        // Active @a -> candidate @b
+        manager.atomic_swap_active_slot(service, Slot::A).unwrap();
+        assert_eq!(manager.resolve_target_slot(service).unwrap(), Slot::B);
+
+        // Active @b -> candidate @a; inferred rollback restores @a
+        manager.atomic_swap_active_slot(service, Slot::B).unwrap();
+        assert_eq!(manager.resolve_target_slot(service).unwrap(), Slot::A);
+        let rb_to_a = manager.rollback_to_prior_slot(service, None).unwrap();
+        assert_eq!(rb_to_a.active_slot, Slot::A);
+        assert_eq!(manager.read_active_slot(service).unwrap(), Some(Slot::A));
+
+        // Now swap @b -> @a leg: active is @a, rollback to explicit @b
+        let rb_to_b = manager
+            .rollback_to_prior_slot(service, Some(Slot::B))
+            .unwrap();
+        assert_eq!(rb_to_b.active_slot, Slot::B);
+        assert_eq!(manager.read_active_slot(service).unwrap(), Some(Slot::B));
     }
 }

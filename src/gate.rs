@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use mu_cd_ipc::{IntegrationTestProgress, TestState};
 
+use crate::error::AgentError;
 use crate::watchdog::now_epoch_ms;
 
 /// Built-in test: the candidate's systemd unit reaches `ActiveState=active`.
@@ -65,27 +66,28 @@ impl IntegrationTestSelection {
     }
 }
 
-/// Expands a selection against the catalog.
-///
-/// `All` returns the whole catalog. `Selected` keeps catalog order and drops names the
-/// agent cannot execute (logged as a warning) so an unknown name never wedges the gate.
+/// Expands a selection against the catalog, failing closed if any requested test is unknown.
 pub fn expand_integration_tests(
     selection: &IntegrationTestSelection,
     catalog: &[GateTest],
-) -> Vec<GateTest> {
+) -> Result<Vec<GateTest>, AgentError> {
     match selection {
-        IntegrationTestSelection::All => catalog.to_vec(),
+        IntegrationTestSelection::All => Ok(catalog.to_vec()),
         IntegrationTestSelection::Selected(names) => {
+            let mut missing = Vec::new();
             for n in names {
-                if !catalog.iter().any(|t| &t.name == n) {
-                    tracing::warn!(test = %n, "Selected integration test is not available on this agent; skipping");
+                if !catalog.iter().any(|t| &t.name == n) && !missing.contains(n) {
+                    missing.push(n.clone());
                 }
             }
-            catalog
+            if !missing.is_empty() {
+                return Err(AgentError::UnknownIntegrationTests(missing));
+            }
+            Ok(catalog
                 .iter()
                 .filter(|t| names.iter().any(|n| n == &t.name))
                 .cloned()
-                .collect()
+                .collect())
         }
     }
 }
@@ -158,6 +160,17 @@ impl GateTracker {
         self.tests.iter().map(|t| self.progress(t)).collect()
     }
 
+    /// Moves one `Pending` test to `Running` and returns its update.
+    pub fn start_test(&mut self, name: &str) -> Option<IntegrationTestProgress> {
+        let i = self.tests.iter().position(|t| t.test.name == name)?;
+        if self.tests[i].state != TestState::Pending {
+            return None;
+        }
+        self.tests[i].state = TestState::Running;
+        self.tests[i].started = Some(Instant::now());
+        Some(self.progress(&self.tests[i]))
+    }
+
     /// Moves every `Pending` test to `Running` and returns the updates.
     pub fn start_all(&mut self) -> Vec<IntegrationTestProgress> {
         let now = Instant::now();
@@ -223,6 +236,15 @@ impl GateTracker {
     pub fn names(&self) -> Vec<String> {
         self.tests.iter().map(|t| t.test.name.clone()).collect()
     }
+
+    /// Returns names of critical tests currently in [`TestState::Failed`].
+    pub fn critical_failures(&self) -> Vec<String> {
+        self.tests
+            .iter()
+            .filter(|t| t.test.critical && t.state == TestState::Failed)
+            .map(|t| t.test.name.clone())
+            .collect()
+    }
 }
 
 /// Verdict for a built-in watchdog check given the last observed probe.
@@ -275,17 +297,29 @@ mod tests {
     #[test]
     fn test_expand_all_and_selected() {
         let catalog = builtin_catalog();
-        let all = expand_integration_tests(&IntegrationTestSelection::All, &catalog);
+        let all = expand_integration_tests(&IntegrationTestSelection::All, &catalog).unwrap();
         assert_eq!(all, catalog);
 
         let sel = expand_integration_tests(
+            &IntegrationTestSelection::Selected(vec![TEST_HEALTH_ENDPOINT_READY.into()]),
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(sel, vec![GateTest::new(TEST_HEALTH_ENDPOINT_READY, true)]);
+
+        // Fail closed on unknown test names rather than silently dropping
+        let err = expand_integration_tests(
             &IntegrationTestSelection::Selected(vec![
                 TEST_HEALTH_ENDPOINT_READY.into(),
                 "not_on_node".into(),
             ]),
             &catalog,
-        );
-        assert_eq!(sel, vec![GateTest::new(TEST_HEALTH_ENDPOINT_READY, true)]);
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::UnknownIntegrationTests(ref missing) if missing == &vec!["not_on_node".to_string()]
+        ));
     }
 
     #[test]

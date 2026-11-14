@@ -13,6 +13,11 @@ max_error_logs: 0
 max_p99_latency_ms: 250.0
 integration_tests: "all"
 
+ab_rules:
+  btrfs_snapshots: true
+  keep_snapshots: 5
+  auto_rollback_on_critical: true
+
 deployment:
   target_nodes:
     - "node-a"

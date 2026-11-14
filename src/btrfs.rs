@@ -2,14 +2,72 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mu_cd_ipc::{DeploymentSlot, StageDeploymentRequest, StageDeploymentResponse};
+use serde::{Deserialize, Serialize};
 
 use crate::error::AgentError;
+use crate::manifest::AbRulesConfig;
+use crate::slot::{read_active_slot_at, Slot};
+
+const ARTIFACT_DIGEST_MARKER: &str = ".artifact_sha256";
+const RETENTION_MANIFEST_FILE: &str = ".retention.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct SnapshotManifest {
+    next_seq: u64,
+    entries: Vec<SnapshotRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SnapshotRecord {
+    name: String,
+    slot: String,
+    digest: String,
+    seq: u64,
+}
+
+fn validate_snapshot_tag(raw: &str) -> Result<&str, AgentError> {
+    if raw.is_empty()
+        || raw.starts_with('.')
+        || raw.contains("..")
+        || raw.contains('/')
+        || raw.contains('\\')
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(AgentError::Slot(format!(
+            "Invalid snapshot digest/tag '{raw}': must match ^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        )));
+    }
+    Ok(raw)
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), AgentError> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from_path = entry.path();
+        let to_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_contents(&from_path, &to_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&from_path, &to_path)?;
+            if let Ok(meta) = fs::metadata(&from_path) {
+                let _ = fs::set_permissions(&to_path, meta.permissions());
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Permitted platform service binaries managed by `mu-cd-agent`.
 ///
@@ -197,17 +255,22 @@ impl CommandRunner for MockCommandRunner {
         }
 
         if self.simulate_fs {
-            // Emulate btrfs subvolume snapshot -r <src> <dest>
+            // Emulate btrfs subvolume snapshot [-r] <src> <dest>
             if program == "btrfs"
                 && args.len() >= 4
                 && args[0] == "subvolume"
                 && args[1] == "snapshot"
             {
+                let src = Path::new(args[args.len() - 2]);
                 let dest = Path::new(args[args.len() - 1]);
                 if let Some(parent) = dest.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                let _ = fs::create_dir_all(dest);
+                if src.is_dir() {
+                    copy_dir_contents(src, dest)?;
+                } else {
+                    let _ = fs::create_dir_all(dest);
+                }
             } else if program == "btrfs"
                 && args.len() >= 3
                 && args[0] == "subvolume"
@@ -251,10 +314,151 @@ impl CommandRunner for MockCommandRunner {
     }
 }
 
+fn load_snapshot_manifest(snapshots_dir: &Path) -> SnapshotManifest {
+    let manifest_path = snapshots_dir.join(RETENTION_MANIFEST_FILE);
+    fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_snapshot_manifest(
+    snapshots_dir: &Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), AgentError> {
+    let manifest_path = snapshots_dir.join(RETENTION_MANIFEST_FILE);
+    let json = serde_json::to_vec_pretty(manifest)
+        .map_err(|e| AgentError::Serialization(e.to_string()))?;
+    fs::write(manifest_path, json)?;
+    Ok(())
+}
+
+fn ordered_snapshot_names(snapshots_dir: &Path, manifest: &SnapshotManifest) -> Vec<String> {
+    if !snapshots_dir.is_dir() {
+        return Vec::new();
+    }
+    let seq_by_name: HashMap<&str, u64> = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.seq))
+        .collect();
+
+    let mut items: Vec<(u64, u128, String)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(snapshots_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if !file_name.starts_with("@snap-") {
+                continue;
+            }
+            let seq = seq_by_name.get(file_name.as_str()).copied().unwrap_or(0);
+            let mtime_nanos = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t: SystemTime| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            items.push((seq, mtime_nanos, file_name));
+        }
+    }
+
+    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    items.into_iter().map(|(_, _, name)| name).collect()
+}
+
+fn find_latest_snapshot_for_slot(
+    service_dir: &Path,
+    restore_slot: Slot,
+) -> Result<Option<PathBuf>, AgentError> {
+    let snapshots_dir = service_dir.join("snapshots");
+    if !snapshots_dir.is_dir() {
+        return Ok(None);
+    }
+    let manifest = load_snapshot_manifest(&snapshots_dir);
+    let ordered = ordered_snapshot_names(&snapshots_dir, &manifest);
+
+    // Prefer newest snapshot recorded explicitly for `restore_slot`
+    for name in ordered.iter().rev() {
+        if let Some(rec) = manifest.entries.iter().find(|r| &r.name == name) {
+            if rec.slot == restore_slot.as_str() {
+                let candidate = snapshots_dir.join(name);
+                if candidate.is_dir() {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
+
+    // Fallback to newest snapshot directory overall when manifest lacks slot metadata
+    Ok(ordered
+        .into_iter()
+        .rev()
+        .map(|name| snapshots_dir.join(name))
+        .find(|path| path.is_dir()))
+}
+
+pub(crate) fn restore_slot_from_latest_snapshot_if_available(
+    service_dir: &Path,
+    restore_slot: Slot,
+    runner: &dyn CommandRunner,
+) -> Result<Option<PathBuf>, AgentError> {
+    let Some(snapshot_path) = find_latest_snapshot_for_slot(service_dir, restore_slot)? else {
+        return Ok(None);
+    };
+    restore_slot_from_snapshot(service_dir, restore_slot, &snapshot_path, runner)?;
+    Ok(Some(snapshot_path))
+}
+
+pub(crate) fn restore_slot_from_latest_snapshot(
+    service_dir: &Path,
+    restore_slot: Slot,
+    runner: &dyn CommandRunner,
+) -> Result<PathBuf, AgentError> {
+    let snapshot_path =
+        find_latest_snapshot_for_slot(service_dir, restore_slot)?.ok_or_else(|| {
+            AgentError::Slot(format!(
+                "No read-only Btrfs snapshot available in {} for slot {}",
+                service_dir.join("snapshots").display(),
+                restore_slot.as_str()
+            ))
+        })?;
+    restore_slot_from_snapshot(service_dir, restore_slot, &snapshot_path, runner)?;
+    Ok(snapshot_path)
+}
+
+fn restore_slot_from_snapshot(
+    service_dir: &Path,
+    restore_slot: Slot,
+    snapshot_path: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<(), AgentError> {
+    let target_slot_dir = service_dir.join(restore_slot.as_str());
+    let target_str = target_slot_dir.to_str().unwrap_or("");
+    let _ = runner.run_command("btrfs", &["subvolume", "delete", target_str]);
+    if target_slot_dir.exists() {
+        let _ = fs::remove_dir_all(&target_slot_dir);
+    }
+
+    let snap_str = snapshot_path.to_str().unwrap_or("");
+    runner.run_command("btrfs", &["subvolume", "snapshot", snap_str, target_str])?;
+    Ok(())
+}
+
+/// Receipt detailing a completed staging preparation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStaging {
+    pub active_slot_before: Option<Slot>,
+    pub staged_slot: Slot,
+    pub staged_binary_path: PathBuf,
+    pub snapshot_path: Option<PathBuf>,
+    pub pruned_snapshots: Vec<String>,
+}
+
 /// Manager for per-service Btrfs subvolumes and binary staging.
 pub struct BtrfsManager {
     root_dir: PathBuf,
     runner: Arc<dyn CommandRunner>,
+    ab_rules: AbRulesConfig,
 }
 
 impl BtrfsManager {
@@ -262,7 +466,18 @@ impl BtrfsManager {
         Self {
             root_dir: root_dir.into(),
             runner,
+            ab_rules: AbRulesConfig::default(),
         }
+    }
+
+    /// Configures declarative [`AbRulesConfig`] snapshot and rollback rules.
+    pub fn with_ab_rules(mut self, ab_rules: AbRulesConfig) -> Self {
+        self.ab_rules = ab_rules;
+        self
+    }
+
+    pub fn ab_rules(&self) -> &AbRulesConfig {
+        &self.ab_rules
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -281,10 +496,80 @@ impl BtrfsManager {
         self.service_dir(service).join(slot_name)
     }
 
-    /// Prepares staging slot `@b` for the given service:
-    /// 1. Takes read-only Btrfs snapshot of current active slot `@a` into `snapshots/@snap-<prev_digest>`.
-    /// 2. Resets writable staging subvolume `@b` (`delete` if exists, then `create`).
-    /// 3. Installs candidate binary into `@b/bin/<service>` using `install -m 755` semantics.
+    /// Resolves the live slot (`@a` or `@b`) from `<svc>/current`.
+    pub fn read_active_slot(&self, service: &str) -> Result<Option<Slot>, AgentError> {
+        validate_service_name(service)?;
+        read_active_slot_at(&self.service_dir(service))
+    }
+
+    /// Reads the staged/active artifact SHA-256 marker recorded inside `<svc>/<slot>/.artifact_sha256`.
+    pub fn read_slot_digest(
+        &self,
+        service: &str,
+        slot: Slot,
+    ) -> Result<Option<String>, AgentError> {
+        validate_service_name(service)?;
+        let marker = self
+            .slot_dir(service, slot.as_str())
+            .join(ARTIFACT_DIGEST_MARKER);
+        if !marker.is_file() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(marker)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    /// Lists retained `@snap-*` snapshots for `service`, ordered oldest to newest.
+    pub fn list_snapshots(&self, service: &str) -> Result<Vec<String>, AgentError> {
+        validate_service_name(service)?;
+        let snapshots_dir = self.snapshots_dir(service);
+        let manifest = load_snapshot_manifest(&snapshots_dir);
+        Ok(ordered_snapshot_names(&snapshots_dir, &manifest))
+    }
+
+    /// Prunes the oldest `@snap-*` subvolumes exceeding `keep_snapshots`.
+    pub fn prune_snapshots(
+        &self,
+        service: &str,
+        keep_snapshots: usize,
+    ) -> Result<Vec<String>, AgentError> {
+        validate_service_name(service)?;
+        let snapshots_dir = self.snapshots_dir(service);
+        if !snapshots_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut manifest = load_snapshot_manifest(&snapshots_dir);
+        let ordered = ordered_snapshot_names(&snapshots_dir, &manifest);
+        let excess = ordered.len().saturating_sub(keep_snapshots);
+        if excess == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut pruned = Vec::with_capacity(excess);
+        for snap_name in ordered.into_iter().take(excess) {
+            let snap_path = snapshots_dir.join(&snap_name);
+            let snap_str = snap_path.to_str().unwrap_or("");
+            let _ = self
+                .runner
+                .run_command("btrfs", &["subvolume", "delete", snap_str]);
+            if snap_path.exists() {
+                fs::remove_dir_all(&snap_path)?;
+            }
+            manifest.entries.retain(|entry| entry.name != snap_name);
+            pruned.push(snap_name);
+        }
+        save_snapshot_manifest(&snapshots_dir, &manifest)?;
+        Ok(pruned)
+    }
+
+    /// Prepares the symmetric candidate slot (`active.other()`, defaulting to `@b` on
+    /// uninitialized layouts) for the given service using configured `ab_rules`.
     pub fn prepare_staging_slot(
         &self,
         service: &str,
@@ -292,62 +577,131 @@ impl BtrfsManager {
         digest: &str,
         prev_digest: &str,
     ) -> Result<PathBuf, AgentError> {
+        let prepared = self.prepare_staging_slot_with_rules(
+            service,
+            candidate_binary_path,
+            digest,
+            prev_digest,
+            None,
+            &self.ab_rules,
+        )?;
+        Ok(prepared.staged_binary_path)
+    }
+
+    /// Prepares the symmetric candidate slot (`live.other()` when `<svc>/current` exists,
+    /// or `requested_target.unwrap_or(Slot::B)` during bootstrap), takes a read-only
+    /// Btrfs snapshot of the active slot, prunes snapshots per `rules.keep_snapshots`,
+    /// and installs `candidate_binary_path` into `<candidate>/bin/<service>`.
+    pub fn prepare_staging_slot_with_rules(
+        &self,
+        service: &str,
+        candidate_binary_path: &Path,
+        digest: &str,
+        prev_digest: &str,
+        requested_target: Option<Slot>,
+        rules: &AbRulesConfig,
+    ) -> Result<PreparedStaging, AgentError> {
         validate_service_name(service)?;
 
         let srv_dir = self.service_dir(service);
-        let snapshots_dir = srv_dir.join("snapshots");
-        let slot_a = self.slot_dir(service, "@a");
-        let slot_b = self.slot_dir(service, "@b");
-
-        // Ensure service root and snapshots container directories exist
+        let snapshots_dir = self.snapshots_dir(service);
         fs::create_dir_all(&snapshots_dir)?;
 
-        // 1. Create read-only snapshot of current active slot (@a) into snapshots/@snap-<prev_digest>
-        let snap_tag = if prev_digest.is_empty() {
-            "initial"
-        } else {
-            prev_digest
+        let active_slot_before = read_active_slot_at(&srv_dir)?;
+        let candidate_slot = match active_slot_before {
+            Some(live) => {
+                let symmetric = live.other();
+                if let Some(req) = requested_target {
+                    if req != symmetric {
+                        tracing::warn!(
+                            service = service,
+                            live_slot = live.as_str(),
+                            requested = req.as_str(),
+                            using = symmetric.as_str(),
+                            "Requested target_slot matches live active slot; enforcing live.other()"
+                        );
+                    }
+                }
+                symmetric
+            }
+            None => requested_target.unwrap_or(Slot::B),
         };
-        let snapshot_dest = snapshots_dir.join(format!("@snap-{}", snap_tag));
+        let snapshot_source_slot = active_slot_before.unwrap_or_else(|| candidate_slot.other());
+        let source_slot_dir = self.slot_dir(service, snapshot_source_slot.as_str());
+        let candidate_slot_dir = self.slot_dir(service, candidate_slot.as_str());
 
-        // Only snapshot if slot @a exists (or mock runner simulates it)
-        if slot_a.exists() || self.root_dir.is_relative() {
+        // Resolve prior digest from explicit argument, active slot marker, or "initial"
+        let recorded_prev = self.read_slot_digest(service, snapshot_source_slot)?;
+        let raw_snap_tag = if !prev_digest.is_empty() {
+            prev_digest.to_string()
+        } else {
+            recorded_prev.unwrap_or_else(|| "initial".to_string())
+        };
+        let snap_tag = validate_snapshot_tag(&raw_snap_tag)?;
+
+        // 1. Create read-only snapshot of active slot into snapshots/@snap-<prev_digest>
+        let mut snapshot_path = None;
+        if rules.btrfs_snapshots && (source_slot_dir.exists() || self.root_dir.is_relative()) {
+            let snap_name = format!("@snap-{snap_tag}");
+            let snapshot_dest = snapshots_dir.join(&snap_name);
             if snapshot_dest.exists() {
                 let _ = self.runner.run_command(
                     "btrfs",
                     &["subvolume", "delete", snapshot_dest.to_str().unwrap_or("")],
                 );
-                let _ = fs::remove_dir_all(&snapshot_dest);
+                if snapshot_dest.exists() {
+                    let _ = fs::remove_dir_all(&snapshot_dest);
+                }
             }
+
             let _ = self.runner.run_command(
                 "btrfs",
                 &[
                     "subvolume",
                     "snapshot",
                     "-r",
-                    slot_a.to_str().unwrap_or("@a"),
+                    source_slot_dir
+                        .to_str()
+                        .unwrap_or(snapshot_source_slot.as_str()),
                     snapshot_dest.to_str().unwrap_or(""),
                 ],
             )?;
+
+            let mut manifest = load_snapshot_manifest(&snapshots_dir);
+            manifest.next_seq = manifest.next_seq.saturating_add(1);
+            let seq = manifest.next_seq;
+            manifest.entries.retain(|entry| entry.name != snap_name);
+            manifest.entries.push(SnapshotRecord {
+                name: snap_name,
+                slot: snapshot_source_slot.as_str().to_string(),
+                digest: snap_tag.to_string(),
+                seq,
+            });
+            save_snapshot_manifest(&snapshots_dir, &manifest)?;
+            snapshot_path = Some(snapshot_dest);
         }
 
-        // 2. Recreate or reset writable staging subvolume @b
-        let slot_b_str = slot_b.to_str().unwrap_or("@b");
-        // Delete if present (ignore non-zero status if subvolume does not yet exist)
+        // 2. Enforce retention policy on historical read-only snapshots
+        let pruned_snapshots = self.prune_snapshots(service, rules.keep_snapshots)?;
+
+        // 3. Recreate or reset writable staging subvolume (`candidate_slot`)
+        let candidate_str = candidate_slot_dir
+            .to_str()
+            .unwrap_or(candidate_slot.as_str());
         let _ = self
             .runner
-            .run_command("btrfs", &["subvolume", "delete", slot_b_str]);
-        if slot_b.exists() {
-            let _ = fs::remove_dir_all(&slot_b);
+            .run_command("btrfs", &["subvolume", "delete", candidate_str]);
+        if candidate_slot_dir.exists() {
+            let _ = fs::remove_dir_all(&candidate_slot_dir);
         }
 
         self.runner
-            .run_command("btrfs", &["subvolume", "create", slot_b_str])?;
+            .run_command("btrfs", &["subvolume", "create", candidate_str])?;
 
-        let bin_dir = slot_b.join("bin");
+        let bin_dir = candidate_slot_dir.join("bin");
         fs::create_dir_all(&bin_dir)?;
 
-        // 3. Install candidate binary into @b/bin/<service> using install -m 755
+        // 4. Install candidate binary into <candidate_slot>/bin/<service> using install -m 755
         let target_binary = bin_dir.join(service);
         let cand_str = candidate_binary_path.to_str().unwrap_or("");
         let target_str = target_binary.to_str().unwrap_or("");
@@ -355,25 +709,39 @@ impl BtrfsManager {
         self.runner
             .run_command("install", &["-m", "755", cand_str, target_str])?;
 
-        // On POSIX systems, verify and guarantee 0755 permissions
         if target_binary.exists() {
             let mut perms = fs::metadata(&target_binary)?.permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&target_binary, perms)?;
         }
 
+        if !digest.trim().is_empty() && candidate_slot_dir.is_dir() {
+            let _ = fs::write(
+                candidate_slot_dir.join(ARTIFACT_DIGEST_MARKER),
+                digest.trim(),
+            );
+        }
+
         if is_static_web_service(service) && self.root_dir == Path::new("/srv/muconde") {
-            let _ = self.stage_static_web_bundle(service, &slot_b);
+            let _ = self.stage_static_web_bundle(service, &candidate_slot_dir);
         }
 
         tracing::info!(
             service = service,
             digest = digest,
+            staged_slot = candidate_slot.as_str(),
             target = %target_binary.display(),
-            "Successfully staged candidate binary into slot @b"
+            pruned_count = pruned_snapshots.len(),
+            "Successfully staged candidate binary into symmetric candidate slot"
         );
 
-        Ok(target_binary)
+        Ok(PreparedStaging {
+            active_slot_before,
+            staged_slot: candidate_slot,
+            staged_binary_path: target_binary,
+            snapshot_path,
+            pruned_snapshots,
+        })
     }
 
     /// Synchronizes static web frontend assets (`dist/`) from the local Git checkout into `slot_dir/dist`.
@@ -484,39 +852,61 @@ impl BtrfsManager {
         Ok(())
     }
 
-    /// Handles incoming `StageDeploymentRequest` from `MuConDe-controller`.
+    /// Handles incoming `StageDeploymentRequest` from `MuConDe-controller`, honoring symmetric
+    /// `active.other()` staging whenever `<svc>/current` is set.
     pub fn handle_stage_deployment_request(
         &self,
         req: &StageDeploymentRequest,
         candidate_binary_path: &Path,
         prev_digest: &str,
     ) -> StageDeploymentResponse {
-        let slot_str = match req.target_slot {
-            DeploymentSlot::SlotA => "@a",
-            DeploymentSlot::SlotB => "@b",
-        };
-        let btrfs_subvolume_path = self.slot_dir(&req.service_name, slot_str);
+        self.handle_stage_deployment_request_with_rules(
+            req,
+            candidate_binary_path,
+            prev_digest,
+            &self.ab_rules,
+        )
+    }
 
-        match self.prepare_staging_slot(
+    /// Handles `StageDeploymentRequest` under explicit [`AbRulesConfig`].
+    pub fn handle_stage_deployment_request_with_rules(
+        &self,
+        req: &StageDeploymentRequest,
+        candidate_binary_path: &Path,
+        prev_digest: &str,
+        rules: &AbRulesConfig,
+    ) -> StageDeploymentResponse {
+        let requested_slot = Slot::from(req.target_slot);
+        match self.prepare_staging_slot_with_rules(
             &req.service_name,
             candidate_binary_path,
             &req.artifact_sha256,
             prev_digest,
+            Some(requested_slot),
+            rules,
         ) {
-            Ok(_) => StageDeploymentResponse {
-                deployment_id: req.deployment_id.clone(),
-                target_slot: req.target_slot,
-                btrfs_subvolume_path: btrfs_subvolume_path.to_string_lossy().to_string(),
-                staged_ok: true,
-                error_message: None,
-            },
-            Err(e) => StageDeploymentResponse {
-                deployment_id: req.deployment_id.clone(),
-                target_slot: req.target_slot,
-                btrfs_subvolume_path: btrfs_subvolume_path.to_string_lossy().to_string(),
-                staged_ok: false,
-                error_message: Some(e.to_string()),
-            },
+            Ok(prepared) => {
+                let btrfs_subvolume_path =
+                    self.slot_dir(&req.service_name, prepared.staged_slot.as_str());
+                StageDeploymentResponse {
+                    deployment_id: req.deployment_id.clone(),
+                    target_slot: DeploymentSlot::from(prepared.staged_slot),
+                    btrfs_subvolume_path: btrfs_subvolume_path.to_string_lossy().to_string(),
+                    staged_ok: true,
+                    error_message: None,
+                }
+            }
+            Err(e) => {
+                let fallback_slot = requested_slot.as_str();
+                let btrfs_subvolume_path = self.slot_dir(&req.service_name, fallback_slot);
+                StageDeploymentResponse {
+                    deployment_id: req.deployment_id.clone(),
+                    target_slot: req.target_slot,
+                    btrfs_subvolume_path: btrfs_subvolume_path.to_string_lossy().to_string(),
+                    staged_ok: false,
+                    error_message: Some(e.to_string()),
+                }
+            }
         }
     }
 }
@@ -675,5 +1065,112 @@ mod tests {
         assert_eq!(resp.deployment_id, "dep-001");
         assert_eq!(resp.target_slot, DeploymentSlot::SlotB);
         assert!(resp.error_message.is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_ping_pong_a_to_b_to_a_staging_retention_and_snapshot_rollback() {
+        use crate::slot::SlotManager;
+        use std::time::Instant;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let service = "mu-cd-agent";
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let rules = AbRulesConfig {
+            btrfs_snapshots: true,
+            keep_snapshots: 2,
+            auto_rollback_on_critical: true,
+        };
+        let btrfs = BtrfsManager::new(&root, runner.clone()).with_ab_rules(rules.clone());
+        let slots = SlotManager::new(&root, runner.clone());
+
+        // Seed initial @a production binary (v1) and point current -> @a
+        let slot_a = btrfs.slot_dir(service, "@a");
+        fs::create_dir_all(slot_a.join("bin")).unwrap();
+        fs::write(slot_a.join("bin").join(service), b"v1-binary").unwrap();
+        fs::write(slot_a.join(".artifact_sha256"), b"sha-v1").unwrap();
+        slots.atomic_swap_active_slot(service, Slot::A).unwrap();
+        assert_eq!(btrfs.read_active_slot(service).unwrap(), Some(Slot::A));
+
+        // Cycle 1: Live @a -> stage v2 into @b (snapshots @a@sha-v1), promote @b
+        let v2 = temp.path().join("cand-v2");
+        fs::write(&v2, b"v2-binary").unwrap();
+        let prep1 = btrfs
+            .prepare_staging_slot_with_rules(service, &v2, "sha-v2", "", None, &rules)
+            .unwrap();
+        assert_eq!(prep1.active_slot_before, Some(Slot::A));
+        assert_eq!(prep1.staged_slot, Slot::B);
+        assert_eq!(
+            fs::read(btrfs.slot_dir(service, "@b").join("bin").join(service)).unwrap(),
+            b"v2-binary"
+        );
+        assert_eq!(
+            btrfs.list_snapshots(service).unwrap(),
+            vec!["@snap-sha-v1".to_string()]
+        );
+        slots.atomic_swap_active_slot(service, Slot::B).unwrap();
+        assert_eq!(btrfs.read_active_slot(service).unwrap(), Some(Slot::B));
+
+        // Cycle 2: Live @b -> stage v3 into @a (snapshots @b@sha-v2), promote @a
+        let v3 = temp.path().join("cand-v3");
+        fs::write(&v3, b"v3-binary").unwrap();
+        let req_bad_slot = StageDeploymentRequest {
+            deployment_id: "dep-2".into(),
+            lease_id: "l-2".into(),
+            service_name: service.into(),
+            artifact_sha256: "sha-v3".into(),
+            // Even if caller passes SlotB while @b is live, agent enforces live.other() (@a)
+            target_slot: DeploymentSlot::SlotB,
+        };
+        let resp2 = btrfs.handle_stage_deployment_request(&req_bad_slot, &v3, "");
+        assert!(resp2.staged_ok);
+        assert_eq!(resp2.target_slot, DeploymentSlot::SlotA);
+        assert!(resp2.btrfs_subvolume_path.ends_with("/@a"));
+        assert_eq!(
+            fs::read(btrfs.slot_dir(service, "@a").join("bin").join(service)).unwrap(),
+            b"v3-binary"
+        );
+        // Live @b remains untouched until swap
+        assert_eq!(
+            fs::read(btrfs.slot_dir(service, "@b").join("bin").join(service)).unwrap(),
+            b"v2-binary"
+        );
+        assert_eq!(
+            btrfs.list_snapshots(service).unwrap(),
+            vec!["@snap-sha-v1".to_string(), "@snap-sha-v2".to_string()]
+        );
+        slots.atomic_swap_active_slot(service, Slot::A).unwrap();
+        assert_eq!(btrfs.read_active_slot(service).unwrap(), Some(Slot::A));
+
+        // Cycle 3: Live @a -> stage v4 into @b; keep_snapshots=2 prunes oldest (@snap-sha-v1)
+        let v4 = temp.path().join("cand-v4");
+        fs::write(&v4, b"v4-binary").unwrap();
+        let prep3 = btrfs
+            .prepare_staging_slot_with_rules(service, &v4, "sha-v4", "", None, &rules)
+            .unwrap();
+        assert_eq!(prep3.staged_slot, Slot::B);
+        assert_eq!(prep3.pruned_snapshots, vec!["@snap-sha-v1".to_string()]);
+        assert_eq!(
+            btrfs.list_snapshots(service).unwrap(),
+            vec!["@snap-sha-v2".to_string(), "@snap-sha-v3".to_string()]
+        );
+        slots.atomic_swap_active_slot(service, Slot::B).unwrap();
+
+        // Simulate missing @a prior slot dir and verify <1s rollback restores @snap-sha-v3 into @a
+        fs::remove_dir_all(btrfs.slot_dir(service, "@a")).unwrap();
+        let start = Instant::now();
+        let rb_receipt = slots
+            .rollback_to_prior_slot(service, Some(Slot::A))
+            .expect("atomic rollback restoring read-only snapshot");
+        let elapsed_ms = start.elapsed().as_millis();
+        assert!(elapsed_ms < 1000, "Rollback took {}ms", elapsed_ms);
+        assert_eq!(rb_receipt.active_slot, Slot::A);
+        assert_eq!(btrfs.read_active_slot(service).unwrap(), Some(Slot::A));
+        assert_eq!(
+            fs::read(btrfs.slot_dir(service, "@a").join("bin").join(service)).unwrap(),
+            b"v3-binary"
+        );
     }
 }
