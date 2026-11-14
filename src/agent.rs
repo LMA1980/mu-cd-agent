@@ -1911,10 +1911,10 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_sandboxed_it_pass_promotes_ping_pong_b_to_a() {
-        use crate::sandbox_it::tests::build_test_tar_gz;
+        use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
         use mu_cd_ipc::TestState;
 
-        let temp = tempdir().unwrap();
+        let temp = exec_tempdir();
         let root = temp.path().join("muconde");
         let cas_dir = temp.path().join("cas");
         let service = "action-runner";
@@ -2046,11 +2046,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn test_sandboxed_it_critical_failure_triggers_immediate_rollback_taint_and_sanitized_log(
     ) {
-        use crate::sandbox_it::{tests::build_test_tar_gz, MAX_LOG_EXCERPT_BYTES};
+        use crate::sandbox_it::{
+            tests::{build_test_tar_gz, exec_tempdir},
+            MAX_LOG_EXCERPT_BYTES,
+        };
         use mu_cd_ipc::TestState;
         use mu_observable_ipc::REDACTED_PLACEHOLDER;
 
-        let temp = tempdir().unwrap();
+        let temp = exec_tempdir();
         let root = temp.path().join("muconde");
         let cas_dir = temp.path().join("cas");
         let service = "action-runner";
@@ -2180,7 +2183,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_sandboxed_it_fails_closed_on_unknown_test_and_sha256_mismatch() {
-        use crate::sandbox_it::tests::build_test_tar_gz;
+        use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
         use mu_cd_ipc::TestState;
 
         let service = "action-runner";
@@ -2188,7 +2191,7 @@ mod tests {
 
         // Case A: Preselected test absent from verified bundle fails closed & rolls back to @a.
         {
-            let temp = tempdir().unwrap();
+            let temp = exec_tempdir();
             let root = temp.path().join("muconde");
             let cas_dir = temp.path().join("cas");
             let srv_dir = root.join(service);
@@ -2280,7 +2283,7 @@ mod tests {
 
         // Case B: Corrupted CAS bundle bytes fail SHA-256 verification closed & roll back to @b.
         {
-            let temp = tempdir().unwrap();
+            let temp = exec_tempdir();
             let root = temp.path().join("muconde");
             let cas_dir = temp.path().join("cas");
             let srv_dir = root.join(service);

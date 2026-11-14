@@ -718,7 +718,9 @@ pub fn build_it_sandbox_plan(
     };
     push_unique_clean(&mut ceiling.allowed_write_prefixes, &canon_work);
 
+    let mut using_security_file = false;
     let desired_profile = if let Some(ref sec_path) = cfg.security_file_path {
+        using_security_file = true;
         let sec_file = DesiredSecurityFile::from_path(sec_path)
             .map_err(|e| AgentError::SandboxViolation(e.to_string()))?;
         let base = sec_file
@@ -733,13 +735,13 @@ pub fn build_it_sandbox_plan(
             .clone();
         DesiredProfileConfig {
             backend: base.backend,
-            read_paths: read_paths.clone(),
-            write_paths: write_paths.clone(),
-            exec_paths: exec_paths.clone(),
+            read_paths: base.read_paths,
+            write_paths: base.write_paths,
+            exec_paths: base.exec_paths,
             network_egress_cidrs: base.network_egress_cidrs,
             memlock_limit_kb: base.memlock_limit_kb,
             max_pids: base.max_pids,
-            max_memory_mb: base.max_memory_mb.or(Some(cfg.max_memory_mb)),
+            max_memory_mb: base.max_memory_mb,
             cpu_affinity_mask: base.cpu_affinity_mask,
             require_set_ai_thread: base.require_set_ai_thread,
         }
@@ -761,17 +763,33 @@ pub fn build_it_sandbox_plan(
         }
     };
 
-    let task = TaskSandboxConfig {
-        backend: Some(SandboxBackendKind::Kernel),
-        read_paths,
-        write_paths,
-        exec_paths,
-        network_mode: cfg.network_mode.clone(),
-        memlock_limit_kb: Some(cfg.memlock_limit_kb),
-        max_pids: Some(cfg.max_pids),
-        max_memory_mb: Some(cfg.max_memory_mb),
-        cpu_affinity_mask: None,
-        require_set_ai_thread: Some(false),
+    let task = if using_security_file {
+        TaskSandboxConfig {
+            backend: Some(SandboxBackendKind::Kernel),
+            read_paths: Vec::new(),
+            write_paths: Vec::new(),
+            exec_paths: Vec::new(),
+            network_mode: cfg.network_mode.clone(),
+            memlock_limit_kb: (cfg.memlock_limit_kb != DEFAULT_IT_MEMLOCK_KB)
+                .then_some(cfg.memlock_limit_kb),
+            max_pids: (cfg.max_pids != MAX_IT_SANDBOX_PIDS).then_some(cfg.max_pids),
+            max_memory_mb: (cfg.max_memory_mb != 1024).then_some(cfg.max_memory_mb),
+            cpu_affinity_mask: None,
+            require_set_ai_thread: None,
+        }
+    } else {
+        TaskSandboxConfig {
+            backend: Some(SandboxBackendKind::Kernel),
+            read_paths,
+            write_paths,
+            exec_paths,
+            network_mode: cfg.network_mode.clone(),
+            memlock_limit_kb: Some(cfg.memlock_limit_kb),
+            max_pids: Some(cfg.max_pids),
+            max_memory_mb: Some(cfg.max_memory_mb),
+            cpu_affinity_mask: None,
+            require_set_ai_thread: Some(false),
+        }
     };
 
     let effective = resolve_effective_policy(&ceiling, &desired_profile, &task)
@@ -915,6 +933,33 @@ pub(crate) mod tests {
     use tar::Builder;
     use tempfile::tempdir;
 
+    pub(crate) fn exec_tempdir() -> tempfile::TempDir {
+        if let Some(target_tmp) = option_env!("CARGO_TARGET_TMPDIR").map(PathBuf::from) {
+            if fs::create_dir_all(&target_tmp).is_ok() {
+                if let Ok(dir) = tempfile::tempdir_in(&target_tmp) {
+                    return dir;
+                }
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            // Test binaries run inside `<target>/<profile>/deps`; `<target>/<profile>/test-tmp`
+            // inherits the same executable filesystem permissions without touching `noexec` `/tmp`.
+            if let Some(profile_dir) = exe.parent().and_then(|p| p.parent()) {
+                let scratch = profile_dir.join("test-tmp");
+                if fs::create_dir_all(&scratch).is_ok() {
+                    if let Ok(dir) = tempfile::tempdir_in(&scratch) {
+                        return dir;
+                    }
+                }
+            }
+        }
+        let fallback = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&fallback).expect("create target/test-tmp");
+        tempfile::tempdir_in(&fallback).expect("create exec tempdir")
+    }
+
     pub(crate) fn build_test_tar_gz(entries: &[(&str, &[u8], u32)]) -> (Vec<u8>, String) {
         let mut tar_bytes = Vec::new();
         {
@@ -1042,7 +1087,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_kernel_sandbox_plan_enforces_max_pids_256_attenuation() {
-        let dir = tempdir().unwrap();
+        let dir = exec_tempdir();
         let argv = vec![OsString::from("/bin/true")];
 
         let cfg = ItSandboxConfig::default();
@@ -1061,6 +1106,87 @@ pub(crate) mod tests {
         assert!(matches!(err, AgentError::SandboxViolation(_)));
     }
 
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_build_it_sandbox_plan_honors_security_file_paths_and_attenuation() {
+        let dir = exec_tempdir();
+        let work_canon = fs::canonicalize(dir.path()).unwrap();
+        let argv = vec![OsString::from("/bin/true")];
+
+        let tighter_sec = dir.path().join("tighter-security.yml");
+        fs::write(
+            &tighter_sec,
+            format!(
+                r#"default_profile: "it_tight"
+profiles:
+  it_tight:
+    backend: Kernel
+    read_paths:
+      - /usr
+      - /bin
+      - {}
+    write_paths: []
+    exec_paths:
+      - /bin
+      - {}
+    network_egress_cidrs: []
+    memlock_limit_kb: 16384
+    max_pids: 64
+    max_memory_mb: 256
+    require_set_ai_thread: false
+"#,
+                work_canon.display(),
+                work_canon.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = ItSandboxConfig {
+            security_file_path: Some(tighter_sec),
+            ..Default::default()
+        };
+        let (policy, _plan) = build_it_sandbox_plan(dir.path(), &argv, &cfg).unwrap();
+        assert_eq!(policy.max_pids, 64);
+        assert_eq!(policy.memlock_limit_kb, 16384);
+        assert_eq!(policy.max_memory_mb, 256);
+        assert_eq!(
+            policy.read_paths,
+            vec![
+                PathBuf::from("/usr"),
+                PathBuf::from("/bin"),
+                work_canon.clone()
+            ]
+        );
+        assert!(policy.write_paths.is_empty());
+        assert_eq!(policy.exec_paths, vec![PathBuf::from("/bin"), work_canon]);
+
+        let widened_sec = dir.path().join("widened-security.yml");
+        fs::write(
+            &widened_sec,
+            r#"default_profile: "it_wide"
+profiles:
+  it_wide:
+    backend: Kernel
+    read_paths:
+      - /usr
+    write_paths: []
+    exec_paths:
+      - /opt/untrusted
+    network_egress_cidrs: []
+    memlock_limit_kb: 16384
+    max_pids: 64
+"#,
+        )
+        .unwrap();
+
+        let widened_cfg = ItSandboxConfig {
+            security_file_path: Some(widened_sec),
+            ..Default::default()
+        };
+        let err = build_it_sandbox_plan(dir.path(), &argv, &widened_cfg).unwrap_err();
+        assert!(matches!(err, AgentError::SandboxViolation(_)));
+    }
+
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_kernel_sandboxed_executor_runs_real_script_with_scrubbed_logs() {
@@ -1076,7 +1202,7 @@ pub(crate) mod tests {
                 0o755,
             ),
         ]);
-        let cas = tempdir().unwrap();
+        let cas = exec_tempdir();
         let blob_dir = cas.path().join("blobs").join("sha256").join(&digest[..2]);
         fs::create_dir_all(&blob_dir).unwrap();
         fs::write(blob_dir.join(&digest), &archive).unwrap();
@@ -1084,7 +1210,7 @@ pub(crate) mod tests {
         let fetcher = RegistryAndCasFetcher::default().with_cas_dir(cas.path());
         let fetched = fetcher.fetch_it_archive(&digest).await.unwrap();
 
-        let work = tempdir().unwrap();
+        let work = exec_tempdir();
         let bundle = unpack_verified_it_archive(&fetched, &digest, work.path()).unwrap();
         let executor = KernelSandboxedExecutor;
         let out = executor
