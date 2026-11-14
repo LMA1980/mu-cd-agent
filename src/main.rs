@@ -37,16 +37,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(PathBuf::from);
 
+    let manifest_dir = std::env::var("MUCONDE_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let manifest = mu_cd_agent::MuCdManifest::load_optional_from_dir(&manifest_dir)?;
+
     // Contract `integration_tests` selector: "all" (default) or a comma-separated list.
-    let integration_tests = std::env::var("MUCONDE_INTEGRATION_TESTS")
-        .map(|v| {
-            let names: Vec<String> = v
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            IntegrationTestSelection::from_names(&names)
-        })
+    let integration_tests = match std::env::var("MUCONDE_INTEGRATION_TESTS") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("all") {
+                IntegrationTestSelection::All
+            } else {
+                let names: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if names.is_empty() {
+                    return Err(mu_cd_agent::AgentError::Config(
+                        "MUCONDE_INTEGRATION_TESTS must be 'all' or a non-empty list".into(),
+                    )
+                    .into());
+                }
+                IntegrationTestSelection::from_names(&names)
+            }
+        }
+        Err(_) => match &manifest {
+            Some(m) => m.selection()?,
+            None => IntegrationTestSelection::default(),
+        },
+    };
+
+    let manifest_digest = manifest.as_ref().and_then(|m| m.it_archive_digest.clone());
+    let ab_rules = manifest
+        .as_ref()
+        .map(|m| m.ab_rules.clone())
         .unwrap_or_default();
 
     let config = MuConDeAgentConfig {
@@ -61,6 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         collector_addr: std::env::var("MUOBSERVE_COLLECTOR_ADDR").ok(),
         integration_tests,
         gate_catalog: builtin_catalog(),
+        ab_rules,
+        it_archive_digest: std::env::var("MUCONDE_IT_ARCHIVE_DIGEST")
+            .ok()
+            .or(manifest_digest),
+        it_bundle_id: std::env::var("MUCONDE_IT_BUNDLE_ID").ok(),
+        registry_url: std::env::var("MUCONDE_REGISTRY_URL").ok(),
+        cas_blobs_dir: std::env::var("MUCONDE_CAS_BLOBS_DIR")
+            .ok()
+            .map(PathBuf::from),
+        ..MuConDeAgentConfig::default()
     };
 
     let runner = Arc::new(SystemCommandRunner::new());

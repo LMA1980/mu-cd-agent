@@ -52,4 +52,16 @@ pub enum AgentError {
 
     #[error("TLS configuration error: {0}")]
     Tls(String),
+
+    #[error("Unknown or unavailable integration test(s): {0:?}")]
+    UnknownIntegrationTests(Vec<String>),
+
+    #[error("Integration test bundle verification or unpack failed: {0}")]
+    BundleVerification(String),
+
+    #[error("Kernel sandbox policy or execution violation: {0}")]
+    SandboxViolation(String),
+
+    #[error("Manifest or configuration error: {0}")]
+    Config(String),
 }

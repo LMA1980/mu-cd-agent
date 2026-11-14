@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mu_cd_ipc::{
-    ArtifactTaintNotification, DeploymentSlot, HealthProbeTelemetry, IntegrationTestReport,
-    RollbackCommand, SlotSwapCommand,
+    ArtifactTaintNotification, HealthProbeTelemetry, IntegrationTestReport, RollbackCommand,
+    SlotSwapCommand,
 };
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -225,29 +225,31 @@ impl WatchdogMonitor {
         &self.node_id
     }
 
-    /// Autonomous sub-second (< 1s) rollback engine reverting the symlink to Slot A
+    /// Autonomous sub-second (< 1s) rollback engine reverting the symlink to `restore_slot`
     /// and generating verification and artifact taint notifications.
     pub fn execute_rollback(
         &self,
         deployment_id: &str,
         service: &str,
+        restore_slot: Slot,
         candidate_artifact_sha256: &str,
         reason: &str,
     ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
         let start = Instant::now();
 
-        // 1. Immediately revert active slot to Slot::A
+        // 1. Immediately revert active slot to `restore_slot` (restoring prior read-only snapshot if needed)
         self.slot_manager
-            .atomic_swap_active_slot(service, Slot::A)?;
+            .rollback_to_prior_slot(service, Some(restore_slot))?;
 
         let elapsed_rollback_ms = start.elapsed().as_millis() as u64;
 
         tracing::warn!(
             deployment_id = deployment_id,
             service = service,
+            restore_slot = restore_slot.as_str(),
             elapsed_ms = elapsed_rollback_ms,
             reason = reason,
-            "Autonomous rollback to Slot A successfully executed"
+            "Autonomous rollback successfully executed"
         );
 
         // 2. Construct IntegrationTestReport with failure details
@@ -263,7 +265,8 @@ impl WatchdogMonitor {
             failed_tests: vec![reason.to_string()],
             duration_ms: elapsed_rollback_ms,
             log_excerpt: Some(format!(
-                "Autonomous watchdog rollback to Slot A triggered: {}",
+                "Autonomous watchdog rollback to {} triggered: {}",
+                restore_slot.as_str(),
                 reason
             )),
         };
@@ -289,6 +292,7 @@ impl WatchdogMonitor {
         self.execute_rollback(
             &cmd.deployment_id,
             &cmd.service_name,
+            Slot::from(cmd.restore_slot),
             &cmd.failed_artifact_sha256,
             &cmd.reason,
         )
@@ -297,7 +301,7 @@ impl WatchdogMonitor {
     /// Runs a bounded post-swap warmup watchdog monitor:
     /// - Checks health at 250ms intervals.
     /// - Emits `HealthProbeTelemetry` per probe tick over `telemetry_tx`.
-    /// - Autonomously executes instant rollback to Slot A (< 1s) upon:
+    /// - Autonomously executes instant rollback to `command.from_slot` (< 1s) upon:
     ///   - Any unhealthy probe or process exit/crash.
     ///   - Deployment lease TTL expiration without controller promotion.
     ///   - External rollback signal via `rollback_rx`.
@@ -313,6 +317,7 @@ impl WatchdogMonitor {
         let warmup_duration = Duration::from_secs(command.warmup_timeout_secs);
         let deadline = Instant::now() + warmup_duration;
         let mut ticker = interval(Duration::from_millis(250));
+        let restore_slot = Slot::from(command.from_slot);
 
         let mut consecutive_successes: u32 = 0;
         let mut total_probes: u32 = 0;
@@ -329,6 +334,7 @@ impl WatchdogMonitor {
                     let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
                         &command.deployment_id,
                         &command.service_name,
+                        restore_slot,
                         candidate_artifact_sha256,
                         &format!("External rollback requested: {}", reason),
                     )?;
@@ -352,6 +358,7 @@ impl WatchdogMonitor {
                         let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
                             &command.deployment_id,
                             &command.service_name,
+                            restore_slot,
                             candidate_artifact_sha256,
                             &reason,
                         )?;
@@ -370,7 +377,7 @@ impl WatchdogMonitor {
                         deployment_id: command.deployment_id.clone(),
                         node_id: self.node_id.clone(),
                         service_name: command.service_name.clone(),
-                        active_slot: DeploymentSlot::SlotB,
+                        active_slot: command.to_slot,
                         systemd_active: probe_res.systemd_active,
                         health_endpoint_ok: probe_res.health_endpoint_ok,
                         probe_latency_ms: probe_res.latency_ms,
@@ -394,6 +401,7 @@ impl WatchdogMonitor {
                         let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
                             &command.deployment_id,
                             &command.service_name,
+                            restore_slot,
                             candidate_artifact_sha256,
                             &reason,
                         )?;
@@ -431,6 +439,7 @@ impl WatchdogMonitor {
                         let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
                             &command.deployment_id,
                             &command.service_name,
+                            restore_slot,
                             candidate_artifact_sha256,
                             &reason,
                         )?;
@@ -450,6 +459,7 @@ impl WatchdogMonitor {
 mod tests {
     use super::*;
     use crate::btrfs::MockCommandRunner;
+    use mu_cd_ipc::DeploymentSlot;
     use std::fs;
     use tempfile::tempdir;
 
@@ -659,5 +669,60 @@ mod tests {
         assert_eq!(taint.artifact_sha256, "sha-failed-direct");
         assert!(taint.rollback_completed);
         assert_eq!(slot_mgr.read_active_slot(service).unwrap(), Some(Slot::A));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_reverse_ping_pong_b_to_a_rollback_restores_slot_b() {
+        let service = "mu-cd-agent";
+        let (temp, slot_mgr, _runner) = setup_env(service);
+
+        // Start active on Slot::A (after swapping @b -> @a)
+        slot_mgr.atomic_swap_active_slot(service, Slot::A).unwrap();
+        let prober = Arc::new(MockHealthProber::new(false));
+        let monitor = WatchdogMonitor::new("test-node", slot_mgr.clone(), prober);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let cmd = SlotSwapCommand {
+            deployment_id: "dep-b-to-a-fail".into(),
+            lease_id: "lease-rev".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotB,
+            to_slot: DeploymentSlot::SlotA,
+            systemd_unit: "mu-cd-agent.service".into(),
+            warmup_timeout_secs: 10,
+        };
+
+        let outcome = monitor
+            .monitor_warmup(
+                &cmd,
+                "sha-bad-a",
+                now_epoch_ms() + 60_000,
+                3,
+                Some(tx),
+                None,
+            )
+            .await
+            .expect("monitor warmup");
+
+        let telem = rx.recv().await.expect("probe telemetry emitted");
+        assert_eq!(telem.active_slot, DeploymentSlot::SlotA);
+
+        match outcome {
+            WatchdogOutcome::RolledBack {
+                report,
+                taint,
+                elapsed_rollback_ms,
+            } => {
+                assert!(elapsed_rollback_ms < 1000);
+                assert!(!report.passed);
+                assert!(report.log_excerpt.as_deref().unwrap().contains("@b"));
+                assert_eq!(taint.artifact_sha256, "sha-bad-a");
+            }
+            WatchdogOutcome::WarmedUp { .. } => panic!("Expected rollback to Slot B"),
+        }
+
+        assert_eq!(slot_mgr.read_active_slot(service).unwrap(), Some(Slot::B));
+        drop(temp);
     }
 }
