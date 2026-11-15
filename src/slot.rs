@@ -10,8 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mu_cd_ipc::DeploymentSlot;
 
-use crate::btrfs::{validate_service_name, CommandRunner};
+use crate::btrfs::{
+    candidate_binary_names, candidate_systemd_units, is_static_web_service, validate_service_name,
+    CommandRunner,
+};
 use crate::error::AgentError;
+use crate::manifest::DeploymentConfig;
 
 /// Deployment slot identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +148,19 @@ impl SlotManager {
         service: &str,
         preferred_restore: Option<Slot>,
     ) -> Result<SwapReceipt, AgentError> {
+        self.rollback_to_prior_slot_with_deployment(service, preferred_restore, None, None)
+    }
+
+    /// Rolls back atomically to `preferred_restore` while honoring declarative [`DeploymentConfig`]
+    /// overrides (suppressing `systemctl restart` for static web bundles and resolving canonical
+    /// systemd unit aliases for daemons).
+    pub fn rollback_to_prior_slot_with_deployment(
+        &self,
+        service: &str,
+        preferred_restore: Option<Slot>,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<SwapReceipt, AgentError> {
         validate_service_name(service)?;
         let restore_slot = match preferred_restore {
             Some(slot) => slot,
@@ -163,7 +180,12 @@ impl SlotManager {
             )?;
         }
 
-        self.atomic_swap_active_slot(service, restore_slot)
+        self.atomic_swap_active_slot_with_deployment(
+            service,
+            restore_slot,
+            deployment,
+            cmd_systemd_unit,
+        )
     }
 
     /// Restores `restore_slot` from the newest read-only snapshot of that slot (or latest
@@ -192,6 +214,22 @@ impl SlotManager {
         service: &str,
         target_slot: Slot,
     ) -> Result<SwapReceipt, AgentError> {
+        self.atomic_swap_active_slot_with_deployment(service, target_slot, None, None)
+    }
+
+    /// Atomically swaps the active slot pointer while applying optional manifest [`DeploymentConfig`]
+    /// and IPC `systemd_unit` overrides:
+    /// - Static web services copy `dist/` to `web_root`, optionally reload `nginx.service` if
+    ///   active, and **never** execute `systemctl restart <service>`.
+    /// - Daemon services resolve canonical/aliased systemd units and install staged binaries to
+    ///   `install_path` (or `/usr/local/bin/<canonical_binary>`).
+    pub fn atomic_swap_active_slot_with_deployment(
+        &self,
+        service: &str,
+        target_slot: Slot,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<SwapReceipt, AgentError> {
         validate_service_name(service)?;
 
         let srv_dir = self.service_dir(service);
@@ -210,50 +248,59 @@ impl SlotManager {
             return Err(AgentError::Io(e));
         }
 
-        // 3. On production root (/srv/muconde), activate static web bundle or binary before service restart
+        // 3. On production root (/srv/muconde), activate static web bundle or binary before restart
         if self.root_dir == Path::new("/srv/muconde") {
             let slot_dir = srv_dir.join(target_slot.as_str());
-            if crate::btrfs::is_static_web_service(service) {
-                let web_root = match service {
-                    "muconsole" | "mu-console" => Some("/var/www/muconsole"),
-                    "action-runner-web" | "mu-ci-web" => Some("/var/www/action-runner-web"),
-                    _ => None,
-                };
-                if let Some(dest) = web_root {
-                    let dist_dir = slot_dir.join("dist");
-                    if dist_dir.is_dir() {
-                        let _ = fs::create_dir_all(dest);
-                        let src_dot = format!("{}/.", dist_dir.display());
-                        let _ = self.runner.run_command("cp", &["-a", &src_dot, dest]);
-                    }
+            if is_static_web_service(service) {
+                let web_root = resolve_web_root(service, deployment)?;
+                let dist_dir = slot_dir.join("dist");
+                if !dist_dir.is_dir() {
+                    return Err(AgentError::Slot(format!(
+                        "Staged static web bundle directory '{}' is missing",
+                        dist_dir.display()
+                    )));
                 }
-            } else {
-                let staged_bin = slot_dir.join("bin").join(service);
-                if staged_bin.is_file() {
-                    if let Ok(meta) = fs::metadata(&staged_bin) {
-                        if meta.len() > 1024 {
-                            if let Some(bin_name) =
-                                crate::btrfs::candidate_binary_names(service).first()
-                            {
-                                let dest_bin = format!("/usr/local/bin/{bin_name}");
-                                let _ = self.runner.run_command(
-                                    "install",
-                                    &["-m", "755", staged_bin.to_str().unwrap_or(""), &dest_bin],
-                                );
-                            }
-                        }
+                fs::create_dir_all(&web_root)?;
+                let src_dot = format!("{}/.", dist_dir.display());
+                self.runner
+                    .run_command("cp", &["-a", &src_dot, &web_root])?;
+            } else if let Some(staged_bin) = find_staged_binary(&slot_dir, service, deployment) {
+                let meta = fs::metadata(&staged_bin)?;
+                if meta.len() > 0 {
+                    if let Some(dest_bin) = resolve_install_binary_path(service, deployment)? {
+                        let staged_str = staged_bin.to_str().ok_or_else(|| {
+                            AgentError::Slot(format!(
+                                "Non-UTF-8 staged binary path: '{}'",
+                                staged_bin.display()
+                            ))
+                        })?;
+                        self.runner
+                            .run_command("install", &["-m", "755", staged_str, &dest_bin])?;
                     }
                 }
             }
         }
 
-        // 4. Trigger systemctl restart <service> via CommandRunner (skip self-restart of muconde-agent mid-RPC)
-        if !(self.root_dir == Path::new("/srv/muconde")
+        // 4. Restart daemon systemd unit (static web services reload nginx only if active, never systemctl restart <service>)
+        if is_static_web_service(service) {
+            if self.root_dir == Path::new("/srv/muconde") {
+                if let Ok(out) = self
+                    .runner
+                    .run_command("systemctl", &["is-active", "--quiet", "nginx.service"])
+                {
+                    if out.status == 0 {
+                        self.runner
+                            .run_command("systemctl", &["reload", "nginx.service"])?;
+                    }
+                }
+            }
+        } else if !(self.root_dir == Path::new("/srv/muconde")
             && matches!(service, "muconde-agent" | "mu-cd-agent"))
         {
-            let restart_arg = service;
+            let restart_target =
+                self.resolve_systemd_restart_target(service, deployment, cmd_systemd_unit)?;
             self.runner
-                .run_command("systemctl", &["restart", restart_arg])?;
+                .run_command("systemctl", &["restart", &restart_target])?;
         }
 
         let swapped_at_epoch_ms = SystemTime::now()
@@ -265,7 +312,7 @@ impl SlotManager {
             service = service,
             slot = target_slot.as_str(),
             swapped_at = swapped_at_epoch_ms,
-            "Successfully executed atomic slot swap and triggered service restart"
+            "Successfully executed atomic slot swap"
         );
 
         Ok(SwapReceipt {
@@ -274,6 +321,189 @@ impl SlotManager {
             swapped_at_epoch_ms,
         })
     }
+
+    fn resolve_systemd_restart_target(
+        &self,
+        service: &str,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<String, AgentError> {
+        let manifest_unit = deployment.and_then(|d| d.normalized_systemd_unit());
+        let cmd_unit = normalize_unit_name(cmd_systemd_unit);
+
+        if let Some(ref u) = manifest_unit {
+            validate_unit_name(u)?;
+        }
+        if let Some(ref u) = cmd_unit {
+            validate_unit_name(u)?;
+        }
+
+        let mut candidates = Vec::new();
+        if let Some(ref u) = manifest_unit {
+            candidates.push(u.clone());
+        }
+        for unit in candidate_systemd_units(service) {
+            if !candidates.contains(&unit) {
+                candidates.push(unit);
+            }
+        }
+        if let Some(ref u) = cmd_unit {
+            if !candidates.contains(u) {
+                candidates.push(u.clone());
+            }
+        }
+
+        if self.root_dir == Path::new("/srv/muconde") || deployment.is_some() || cmd_unit.is_some()
+        {
+            if let Some(found) = select_installed_systemd_unit(self.runner.as_ref(), &candidates) {
+                return Ok(found);
+            }
+        }
+
+        if let Some(u) = manifest_unit {
+            return Ok(u);
+        }
+        if let Some(u) = cmd_unit {
+            return Ok(u);
+        }
+        if self.root_dir != Path::new("/srv/muconde") {
+            return Ok(service.to_string());
+        }
+        Ok(candidates
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| format!("{service}.service")))
+    }
+}
+
+fn normalize_unit_name(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if trimmed.contains('.') {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("{trimmed}.service"))
+    }
+}
+
+fn validate_unit_name(unit: &str) -> Result<(), AgentError> {
+    if unit.is_empty()
+        || unit.contains("..")
+        || unit.contains('/')
+        || unit.contains('\\')
+        || !unit
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'@'))
+    {
+        return Err(AgentError::InvalidServiceName(format!(
+            "Unsafe systemd unit name '{unit}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolves the destination Nginx web root for a static web service.
+pub fn resolve_web_root(
+    service: &str,
+    deployment: Option<&DeploymentConfig>,
+) -> Result<String, AgentError> {
+    if let Some(raw) = deployment.and_then(|d| d.normalized_web_root()) {
+        if raw.contains("..")
+            || raw.contains('\\')
+            || (!raw.starts_with("/var/www/") && !raw.starts_with("/srv/www/"))
+        {
+            return Err(AgentError::PathTraversal(format!(
+                "Refusing unsafe static web_root '{raw}' (must live under /var/www/ or /srv/www/)"
+            )));
+        }
+        return Ok(raw.to_string());
+    }
+
+    let default = match service {
+        "muconsole" | "mu-console" => "/var/www/muconsole",
+        "mu-ci-web" => "/var/www/mu-ci-web",
+        "action-runner-web" => "/var/www/action-runner-web",
+        other => {
+            return Err(AgentError::Slot(format!(
+                "No default web_root mapped for static web service '{other}'"
+            )))
+        }
+    };
+    Ok(default.to_string())
+}
+
+/// Resolves the host destination binary path under `/usr/local/bin/` (or validated `install_path`).
+pub fn resolve_install_binary_path(
+    service: &str,
+    deployment: Option<&DeploymentConfig>,
+) -> Result<Option<String>, AgentError> {
+    if let Some(raw) = deployment.and_then(|d| d.normalized_install_path()) {
+        if raw.contains("..")
+            || raw.contains('\\')
+            || (!raw.starts_with("/usr/local/bin/") && !raw.starts_with("/usr/bin/"))
+        {
+            return Err(AgentError::PathTraversal(format!(
+                "Refusing unsafe install_path '{raw}' (must live under /usr/local/bin/ or /usr/bin/)"
+            )));
+        }
+        return Ok(Some(raw.to_string()));
+    }
+    if let Some(bin) = deployment.and_then(|d| d.normalized_binary()) {
+        if bin.contains('/') || bin.contains('\\') || bin.contains("..") {
+            return Err(AgentError::PathTraversal(bin.to_string()));
+        }
+        return Ok(Some(format!("/usr/local/bin/{bin}")));
+    }
+    Ok(candidate_binary_names(service)
+        .first()
+        .map(|bin_name| format!("/usr/local/bin/{bin_name}")))
+}
+
+fn find_staged_binary(
+    slot_dir: &Path,
+    service: &str,
+    deployment: Option<&DeploymentConfig>,
+) -> Option<PathBuf> {
+    let bin_dir = slot_dir.join("bin");
+    let mut names: Vec<&str> = vec![service];
+    if let Some(bin) = deployment.and_then(|d| d.normalized_binary()) {
+        if !names.contains(&bin) {
+            names.push(bin);
+        }
+    }
+    for alias in candidate_binary_names(service) {
+        if !names.contains(alias) {
+            names.push(alias);
+        }
+    }
+    names
+        .into_iter()
+        .map(|n| bin_dir.join(n))
+        .find(|p| p.is_file())
+}
+
+/// Selects the first installed systemd unit from ordered `candidates` using `systemctl`.
+pub fn select_installed_systemd_unit(
+    runner: &dyn CommandRunner,
+    candidates: &[String],
+) -> Option<String> {
+    for unit in candidates {
+        if let Ok(out) = runner.run_command("systemctl", &["list-unit-files", unit]) {
+            if out.status == 0
+                && out
+                    .stdout
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(unit.as_str()))
+            {
+                return Some(unit.clone());
+            }
+        }
+        if let Ok(out) = runner.run_command("systemctl", &["cat", unit]) {
+            if out.status == 0 && !out.stdout.trim().is_empty() {
+                return Some(unit.clone());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -403,5 +633,87 @@ mod tests {
             .unwrap();
         assert_eq!(rb_to_b.active_slot, Slot::B);
         assert_eq!(manager.read_active_slot(service).unwrap(), Some(Slot::B));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_static_web_swap_suppresses_systemctl_restart_and_resolves_canonical_units() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let manager = SlotManager::new(&root, runner.clone());
+
+        fs::create_dir_all(root.join("mu-console/@a/dist")).unwrap();
+        fs::write(
+            root.join("mu-console/@a/dist/index.html"),
+            b"<html>ok</html>",
+        )
+        .unwrap();
+        let receipt = manager
+            .atomic_swap_active_slot("mu-console", Slot::A)
+            .expect("static web swap should succeed");
+        assert_eq!(receipt.active_slot, Slot::A);
+        assert!(
+            !runner
+                .recorded_calls()
+                .iter()
+                .any(|c| c.contains(&"restart".to_string())),
+            "Static web swap must never call systemctl restart"
+        );
+
+        // Daemon systemd alias discovery picks installed alias over stale legacy command name
+        runner.set_command_output(
+            "systemctl list-unit-files mu-registry.service",
+            crate::btrfs::CommandOutput {
+                status: 0,
+                stdout: "mu-registry.service enabled enabled\n\n1 unit files listed.\n".into(),
+                stderr: String::new(),
+            },
+        );
+        fs::create_dir_all(root.join("muregist/@b")).unwrap();
+        manager
+            .atomic_swap_active_slot_with_deployment(
+                "muregist",
+                Slot::B,
+                None,
+                Some("muregist.service"),
+            )
+            .unwrap();
+        let restart_call = runner
+            .recorded_calls()
+            .into_iter()
+            .find(|c| c.len() >= 3 && c[0] == "systemctl" && c[1] == "restart")
+            .unwrap();
+        assert_eq!(
+            restart_call,
+            vec!["systemctl", "restart", "mu-registry.service"]
+        );
+
+        // Manifest deployment override wins cleanly
+        let dep = DeploymentConfig {
+            install_path: Some("/usr/local/bin/mu-observable-sentinel".into()),
+            systemd_unit: Some("mu-observable-sentinel.service".into()),
+            web_root: Some("/var/www/muconsole".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_install_binary_path("muobserve-sentinel", Some(&dep))
+                .unwrap()
+                .as_deref(),
+            Some("/usr/local/bin/mu-observable-sentinel")
+        );
+        assert_eq!(
+            resolve_web_root("mu-console", Some(&dep)).unwrap(),
+            "/var/www/muconsole"
+        );
+        // Unsafe path traversal in deployment config fails closed
+        let unsafe_dep = DeploymentConfig {
+            web_root: Some("/etc/nginx".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_web_root("mu-console", Some(&unsafe_dep)),
+            Err(AgentError::PathTraversal(_))
+        ));
     }
 }

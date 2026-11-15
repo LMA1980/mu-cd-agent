@@ -86,6 +86,58 @@ impl RawIntegrationTestsField {
     }
 }
 
+/// Declarative deployment target and binary/systemd unit overrides (`deployment` in `mu-cd.yml`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DeploymentConfig {
+    pub target_nodes: Vec<String>,
+    pub binary: Option<String>,
+    pub install_path: Option<String>,
+    pub systemd_unit: Option<String>,
+    pub web_root: Option<String>,
+    pub artifact: Option<String>,
+}
+
+impl DeploymentConfig {
+    /// Returns the trimmed `binary` override when non-empty.
+    pub fn normalized_binary(&self) -> Option<&str> {
+        self.binary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns the trimmed `install_path` override when non-empty.
+    pub fn normalized_install_path(&self) -> Option<&str> {
+        self.install_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns the trimmed `systemd_unit` override with a `.service` suffix when no unit type suffix is present.
+    pub fn normalized_systemd_unit(&self) -> Option<String> {
+        let trimmed = self
+            .systemd_unit
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        if trimmed.contains('.') {
+            Some(trimmed.to_string())
+        } else {
+            Some(format!("{trimmed}.service"))
+        }
+    }
+
+    /// Returns the trimmed `web_root` override when non-empty.
+    pub fn normalized_web_root(&self) -> Option<&str> {
+        self.web_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 /// Declarative per-service deployment contract parsed from `.mucd/mu-cd.yml`
 /// or legacy `.muconde/MuConDe.yml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -93,11 +145,15 @@ pub struct MuCdManifest {
     pub version: Option<String>,
     pub service: Option<String>,
     #[serde(default)]
+    pub target_nodes: Vec<String>,
+    #[serde(default)]
     pub integration_tests: RawIntegrationTestsField,
     #[serde(default)]
     pub it_archive_digest: Option<String>,
     #[serde(default)]
     pub ab_rules: AbRulesConfig,
+    #[serde(default)]
+    pub deployment: DeploymentConfig,
 }
 
 impl MuCdManifest {
@@ -216,5 +272,61 @@ integration_tests: []
             .unwrap()
             .unwrap();
         assert_eq!(loaded_primary.ab_rules.keep_snapshots, 4);
+    }
+
+    #[test]
+    fn test_parse_manifest_deployment_block_and_defaults() {
+        let yaml_daemon = r#"
+version: "1"
+service: "mu-cd-agent"
+target_nodes:
+  - "node-a"
+  - "worker-riscv64"
+  - "worker-aarch64"
+integration_tests: "all"
+deployment:
+  target_nodes:
+    - "node-a"
+    - "worker-riscv64"
+    - "worker-aarch64"
+  binary: "mu-cd-agent"
+  install_path: "/usr/local/bin/mu-cd-agent"
+  systemd_unit: "mu-cd-agent"
+"#;
+        let daemon = MuCdManifest::from_yaml_str(yaml_daemon).expect("parse daemon manifest");
+        assert_eq!(
+            daemon.target_nodes,
+            vec!["node-a", "worker-riscv64", "worker-aarch64"]
+        );
+        assert_eq!(daemon.deployment.normalized_binary(), Some("mu-cd-agent"));
+        assert_eq!(
+            daemon.deployment.normalized_install_path(),
+            Some("/usr/local/bin/mu-cd-agent")
+        );
+        assert_eq!(
+            daemon.deployment.normalized_systemd_unit().as_deref(),
+            Some("mu-cd-agent.service")
+        );
+
+        let yaml_web = r#"
+version: "1"
+service: "muconsole"
+integration_tests: "all"
+deployment:
+  web_root: "/var/www/muconsole"
+  artifact: "dist"
+"#;
+        let web = MuCdManifest::from_yaml_str(yaml_web).expect("parse web manifest");
+        assert_eq!(
+            web.deployment.normalized_web_root(),
+            Some("/var/www/muconsole")
+        );
+        assert_eq!(web.deployment.artifact.as_deref(), Some("dist"));
+
+        let yaml_minimal = "version: \"1\"\nservice: \"mu-registry\"\n";
+        let minimal = MuCdManifest::from_yaml_str(yaml_minimal).expect("parse minimal manifest");
+        assert_eq!(minimal.deployment, DeploymentConfig::default());
+        assert!(minimal.deployment.normalized_binary().is_none());
+        assert!(minimal.deployment.normalized_systemd_unit().is_none());
     }
 }

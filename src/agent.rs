@@ -31,11 +31,12 @@ use crate::error::AgentError;
 use crate::gate::{
     builtin_catalog, builtin_verdict, GateTest, GateTracker, IntegrationTestSelection,
 };
-use crate::manifest::{AbRulesConfig, MuCdManifest};
+use crate::manifest::{AbRulesConfig, DeploymentConfig, MuCdManifest};
 use crate::sandbox_it::{
     resolve_gate_plan_with_base, sanitize_and_bound_log_excerpt, unpack_verified_it_archive,
-    DiscoveredItTest, ItArchiveFetcher, ItSandboxConfig, KernelSandboxedExecutor,
-    RegistryAndCasFetcher, SandboxedCommandExecutor, MAX_LOG_EXCERPT_BYTES,
+    validate_sha256_digest, DiscoveredItTest, ItArchiveFetcher, ItSandboxConfig,
+    KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor,
+    MAX_LOG_EXCERPT_BYTES,
 };
 use crate::slot::{Slot, SlotManager};
 use crate::telemetry::{
@@ -71,6 +72,8 @@ pub struct MuConDeAgentConfig {
     pub it_bundle_id: Option<String>,
     /// Optional base URL of `mu-registry` HTTP/mTLS API.
     pub registry_url: Option<String>,
+    /// Optional Bearer authentication token for `mu-registry` artifact and IT archive fetches.
+    pub registry_token: Option<String>,
     /// Optional local CAS blob directory root for offline/on-node IT bundle lookups.
     pub cas_blobs_dir: Option<PathBuf>,
     /// `MuIsolation::KernelSandbox` constraints enforced for IT execution (`max_pids: 256`).
@@ -95,6 +98,7 @@ impl Default for MuConDeAgentConfig {
             it_archive_digest: None,
             it_bundle_id: None,
             registry_url: None,
+            registry_token: None,
             cas_blobs_dir: None,
             it_sandbox: ItSandboxConfig::default(),
         }
@@ -255,15 +259,49 @@ pub struct MuConDeAgent {
     staged_digests: Arc<Mutex<HashMap<String, String>>>,
 }
 
+struct ServiceContract {
+    selection: IntegrationTestSelection,
+    it_archive_digest: Option<String>,
+    ab_rules: AbRulesConfig,
+    deployment: DeploymentConfig,
+}
+
+fn validate_staging_artifact_token(raw: &str) -> Result<&str, AgentError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err(AgentError::BundleVerification(format!(
+            "Unsafe artifact_sha256 identifier '{raw}'"
+        )));
+    }
+    Ok(trimmed)
+}
+
 impl MuConDeAgent {
     pub fn new(
         config: MuConDeAgentConfig,
         runner: Arc<dyn CommandRunner>,
         prober: Arc<dyn HealthProber>,
     ) -> Self {
+        let artifact_fetcher = RegistryAndCasFetcher {
+            cas_dir: config.cas_blobs_dir.clone(),
+            registry_url: config.registry_url.clone(),
+            bundle_id: config.it_bundle_id.clone(),
+            bearer_token: config.registry_token.clone(),
+            tls_ca_path: config.tls_ca_path.clone(),
+            tls_cert_path: config.tls_cert_path.clone(),
+            tls_key_path: config.tls_key_path.clone(),
+        };
         let btrfs_manager = Arc::new(
             BtrfsManager::new(&config.muconde_root, runner.clone())
-                .with_ab_rules(config.ab_rules.clone()),
+                .with_ab_rules(config.ab_rules.clone())
+                .with_cas_blobs_dir(config.cas_blobs_dir.clone())
+                .with_artifact_fetcher(artifact_fetcher.clone()),
         );
         let slot_manager = Arc::new(SlotManager::new(&config.muconde_root, runner));
         let watchdog_monitor = Arc::new(WatchdogMonitor::new(
@@ -272,15 +310,7 @@ impl MuConDeAgent {
             prober,
         ));
         let telemetry_sink = Arc::new(MuObserveCollectorSink::new(config.collector_addr.clone()));
-        let it_fetcher = Arc::new(RegistryAndCasFetcher {
-            cas_dir: config.cas_blobs_dir.clone(),
-            registry_url: config.registry_url.clone(),
-            bundle_id: config.it_bundle_id.clone(),
-            bearer_token: None,
-            tls_ca_path: config.tls_ca_path.clone(),
-            tls_cert_path: config.tls_cert_path.clone(),
-            tls_key_path: config.tls_key_path.clone(),
-        });
+        let it_fetcher = Arc::new(artifact_fetcher);
         let it_executor = Arc::new(KernelSandboxedExecutor);
 
         Self {
@@ -320,7 +350,7 @@ impl MuConDeAgent {
         &self,
         service_name: &str,
         slot: Option<Slot>,
-    ) -> Result<(IntegrationTestSelection, Option<String>, AbRulesConfig), AgentError> {
+    ) -> Result<ServiceContract, AgentError> {
         let mut search_dirs = Vec::new();
         if let Some(s) = slot {
             search_dirs.push(self.btrfs_manager.slot_dir(service_name, s.as_str()));
@@ -334,15 +364,21 @@ impl MuConDeAgent {
                 let digest = manifest
                     .it_archive_digest
                     .or_else(|| self.config.it_archive_digest.clone());
-                return Ok((selection, digest, manifest.ab_rules));
+                return Ok(ServiceContract {
+                    selection,
+                    it_archive_digest: digest,
+                    ab_rules: manifest.ab_rules,
+                    deployment: manifest.deployment,
+                });
             }
         }
 
-        Ok((
-            self.config.integration_tests.clone(),
-            self.config.it_archive_digest.clone(),
-            self.config.ab_rules.clone(),
-        ))
+        Ok(ServiceContract {
+            selection: self.config.integration_tests.clone(),
+            it_archive_digest: self.config.it_archive_digest.clone(),
+            ab_rules: self.config.ab_rules.clone(),
+            deployment: DeploymentConfig::default(),
+        })
     }
 
     fn clone_for_connection(&self) -> Self {
@@ -460,29 +496,43 @@ impl MuConDeAgent {
                     let start_ns = now_unix_nano();
                     let trace_ctx = trace_context_for_deployment(&req.deployment_id, 1);
 
-                    // Locate staging candidate binary path
-                    let candidate_path = self
-                        .config
-                        .muconde_root
-                        .join("staging")
-                        .join(&req.artifact_sha256);
+                    let stage_res = async {
+                        let artifact_token = validate_staging_artifact_token(&req.artifact_sha256)?;
+                        let candidate_path = self
+                            .config
+                            .muconde_root
+                            .join("staging")
+                            .join(artifact_token);
 
-                    if self.config.muconde_root == Path::new("/srv/muconde") {
-                        let _ = self.btrfs_manager.ensure_candidate_artifact(
-                            &req.service_name,
-                            &req.artifact_sha256,
-                            &candidate_path,
-                        );
+                        let is_prod = self.config.muconde_root == Path::new("/srv/muconde");
+                        let has_artifact_source = self.config.registry_url.is_some()
+                            || self.config.cas_blobs_dir.is_some();
+                        let is_sha256 = validate_sha256_digest(artifact_token).is_ok();
+                        let missing_local = !candidate_path.is_file();
+
+                        if is_prod || has_artifact_source || is_sha256 || missing_local {
+                            self.btrfs_manager
+                                .ensure_candidate_artifact(
+                                    &req.service_name,
+                                    artifact_token,
+                                    &candidate_path,
+                                )
+                                .await?;
+                        }
+
+                        let contract = self.resolve_service_contract(&req.service_name, None)?;
+                        Ok::<_, AgentError>((candidate_path, contract))
                     }
+                    .await;
 
-                    let resp = match self.resolve_service_contract(&req.service_name, None) {
-                        Ok((_, _, ab_rules)) => self
+                    let resp = match stage_res {
+                        Ok((candidate_path, contract)) => self
                             .btrfs_manager
                             .handle_stage_deployment_request_with_rules(
                                 &req,
                                 &candidate_path,
                                 "",
-                                &ab_rules,
+                                &contract.ab_rules,
                             ),
                         Err(e) => mu_cd_ipc::StageDeploymentResponse {
                             deployment_id: req.deployment_id.clone(),
@@ -772,12 +822,11 @@ impl MuConDeAgent {
         ),
         AgentError,
     > {
-        let (selection, it_digest_opt, ab_rules) =
-            self.resolve_service_contract(&cmd.service_name, Some(target_slot))?;
+        let contract = self.resolve_service_contract(&cmd.service_name, Some(target_slot))?;
 
         let mut unpack_guard = None;
         let mut unpacked_bundle = None;
-        if let Some(ref digest) = it_digest_opt {
+        if let Some(ref digest) = contract.it_archive_digest {
             let dir_guard =
                 EphemeralUnpackDir::create(&self.config.muconde_root, &cmd.deployment_id)?;
             let archive_bytes = self.it_fetcher.fetch_it_archive(digest).await?;
@@ -788,10 +837,10 @@ impl MuConDeAgent {
 
         let (gate_tests, custom_tests) = resolve_gate_plan_with_base(
             &self.config.gate_catalog,
-            &selection,
+            &contract.selection,
             unpacked_bundle.as_ref(),
         )?;
-        Ok((gate_tests, custom_tests, unpack_guard, ab_rules))
+        Ok((gate_tests, custom_tests, unpack_guard, contract.ab_rules))
     }
 
     async fn execute_slot_swap_and_gate<S: AsyncWrite + Unpin>(
@@ -821,9 +870,13 @@ impl MuConDeAgent {
             .or(disk_sha)
             .unwrap_or_else(|| "candidate-sha".to_string());
 
-        let _receipt = self
-            .slot_manager
-            .atomic_swap_active_slot(&cmd.service_name, target_slot)?;
+        let contract = self.resolve_service_contract(&cmd.service_name, Some(target_slot))?;
+        let _receipt = self.slot_manager.atomic_swap_active_slot_with_deployment(
+            &cmd.service_name,
+            target_slot,
+            Some(&contract.deployment),
+            Some(&cmd.systemd_unit),
+        )?;
 
         let swap_end_ns = now_unix_nano().max(swap_start_ns);
         let swap_dur_ns = (swap_end_ns - swap_start_ns) as u64;
@@ -1913,6 +1966,7 @@ mod tests {
     async fn test_sandboxed_it_pass_promotes_ping_pong_b_to_a() {
         use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
         use mu_cd_ipc::TestState;
+        use sha2::{Digest, Sha256};
 
         let temp = exec_tempdir();
         let root = temp.path().join("muconde");
@@ -1937,6 +1991,10 @@ mod tests {
             ),
         ]);
         write_cas_blob(&cas_dir, &digest, &archive);
+
+        let candidate_bytes = b"#!/bin/sh\necho verified-candidate-v2\n";
+        let candidate_sha = hex::encode(Sha256::digest(candidate_bytes));
+        write_cas_blob(&cas_dir, &candidate_sha, candidate_bytes);
 
         let mut config = MuConDeAgentConfig {
             node_id: "node-it-pass".into(),
@@ -1966,7 +2024,6 @@ mod tests {
         });
 
         let fory = create_fory_runtime().unwrap();
-        let candidate_sha = "a".repeat(64);
         let stage_req = StageDeploymentRequest {
             deployment_id: "dep-it-pass".into(),
             lease_id: "lease-it-pass".into(),
@@ -2052,6 +2109,7 @@ mod tests {
         };
         use mu_cd_ipc::TestState;
         use mu_observable_ipc::REDACTED_PLACEHOLDER;
+        use sha2::{Digest, Sha256};
 
         let temp = exec_tempdir();
         let root = temp.path().join("muconde");
@@ -2075,6 +2133,10 @@ mod tests {
             ),
         ]);
         write_cas_blob(&cas_dir, &digest, &archive);
+
+        let candidate_bytes = b"#!/bin/sh\necho verified-candidate-bad-it\n";
+        let candidate_sha = hex::encode(Sha256::digest(candidate_bytes));
+        write_cas_blob(&cas_dir, &candidate_sha, candidate_bytes);
 
         let config = MuConDeAgentConfig {
             node_id: "node-it-fail".into(),
@@ -2102,7 +2164,6 @@ mod tests {
         });
 
         let fory = create_fory_runtime().unwrap();
-        let candidate_sha = "b".repeat(64);
         let stage_req = StageDeploymentRequest {
             deployment_id: "dep-it-fail".into(),
             lease_id: "lease-it-fail".into(),
@@ -2364,5 +2425,92 @@ mod tests {
             drop(client);
             let _ = agent_task.await;
         }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_stage_deployment_request_fails_closed_on_invalid_missing_or_mismatched_cas_artifact(
+    ) {
+        use sha2::{Digest, Sha256};
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cas_dir).unwrap();
+
+        let valid_bytes = b"#!/bin/sh\necho ok\n";
+        let valid_sha = hex::encode(Sha256::digest(valid_bytes));
+        write_cas_blob(&cas_dir, &valid_sha, valid_bytes);
+
+        let config = MuConDeAgentConfig {
+            node_id: "node-cas-strict".into(),
+            muconde_root: root.clone(),
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        let agent = Arc::new(MuConDeAgent::new(
+            config,
+            Arc::new(MockCommandRunner::new(true)),
+            Arc::new(MockHealthProber::new(true)),
+        ));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+        let fory = create_fory_runtime().unwrap();
+
+        async fn send_stage(
+            client: &mut tokio::io::DuplexStream,
+            fory_ref: &fory::Fory,
+            digest: String,
+            seq: u64,
+        ) -> StageDeploymentResponse {
+            let req = StageDeploymentRequest {
+                deployment_id: format!("dep-{seq}"),
+                lease_id: "lease-strict".into(),
+                service_name: "mu-cd-agent".into(),
+                artifact_sha256: digest,
+                target_slot: DeploymentSlot::SlotB,
+            };
+            let bytes = fory_ref.serialize(&req).unwrap();
+            let hdr = IpcHeader::new(MSG_TYPE_STAGE_DEPLOY_REQ, bytes.len() as u32, 0, seq);
+            write_frame(client, &hdr, &bytes).await.unwrap();
+            let (_, resp_bytes) = read_frame(client).await.unwrap();
+            fory_ref
+                .deserialize::<StageDeploymentResponse>(&resp_bytes)
+                .unwrap()
+        }
+
+        // 1. Path traversal token fails closed
+        let r1 = send_stage(&mut client, &fory, "../evil".into(), 1).await;
+        assert!(!r1.staged_ok);
+        assert!(r1.error_message.is_some());
+
+        // 2. Non-existent CAS digest fails closed
+        let missing_sha = "d".repeat(64);
+        let r2 = send_stage(&mut client, &fory, missing_sha, 2).await;
+        assert!(!r2.staged_ok);
+        assert!(r2.error_message.is_some());
+
+        // 3. Mismatched pre-existing staging artifact fails closed and removes corrupt file
+        let tampered_sha = "c".repeat(64);
+        let staging_dir = root.join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let tampered_path = staging_dir.join(&tampered_sha);
+        fs::write(&tampered_path, b"corrupted-binary").unwrap();
+        let r3 = send_stage(&mut client, &fory, tampered_sha, 3).await;
+        assert!(!r3.staged_ok);
+        assert!(r3.error_message.is_some());
+        assert!(!tampered_path.exists());
+
+        // 4. Verified CAS blob stages successfully
+        let r4 = send_stage(&mut client, &fory, valid_sha, 4).await;
+        assert!(r4.staged_ok);
+
+        drop(client);
+        let _ = agent_task.await;
     }
 }

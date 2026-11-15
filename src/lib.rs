@@ -24,7 +24,9 @@ pub use gate::{
     builtin_catalog, expand_integration_tests, GateTest, GateTracker, IntegrationTestSelection,
     TEST_HEALTH_ENDPOINT_READY, TEST_SYSTEMD_UNIT_ACTIVE,
 };
-pub use manifest::{AbRulesConfig, MuCdManifest, RawIntegrationTestsField, DEFAULT_KEEP_SNAPSHOTS};
+pub use manifest::{
+    AbRulesConfig, DeploymentConfig, MuCdManifest, RawIntegrationTestsField, DEFAULT_KEEP_SNAPSHOTS,
+};
 pub use sandbox_it::{
     build_it_sandbox_plan, canonical_sandbox_arch, resolve_gate_plan, resolve_gate_plan_with_base,
     sanitize_and_bound_log_excerpt, unpack_verified_it_archive, validate_sha256_digest,

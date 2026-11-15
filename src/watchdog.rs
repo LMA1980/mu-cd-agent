@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,9 +15,10 @@ use mu_cd_ipc::{
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::btrfs::CommandRunner;
+use crate::btrfs::{candidate_systemd_units, is_static_web_service, CommandRunner};
 use crate::error::AgentError;
-use crate::slot::{Slot, SlotManager};
+use crate::manifest::{DeploymentConfig, MuCdManifest};
+use crate::slot::{read_active_slot_at, Slot, SlotManager};
 
 /// Current timestamp in milliseconds since Unix epoch.
 pub fn now_epoch_ms() -> u64 {
@@ -49,9 +51,13 @@ pub trait HealthProber: Send + Sync {
 
 /// Real system prober checking systemd unit state (`ActiveState=active && SubState=running`)
 /// and optional local health endpoint.
+///
+/// Static web services probe `nginx.service` and the active slot layout instead of a nonexistent
+/// `<web-service>.service` unit; daemon services probe canonical and aliased systemd units.
 pub struct SystemHealthProber {
     runner: Arc<dyn CommandRunner>,
     health_endpoint_ports: std::collections::HashMap<String, u16>,
+    muconde_root: Option<PathBuf>,
 }
 
 impl SystemHealthProber {
@@ -59,12 +65,76 @@ impl SystemHealthProber {
         Self {
             runner,
             health_endpoint_ports: std::collections::HashMap::new(),
+            muconde_root: None,
         }
     }
 
     pub fn with_endpoint(mut self, service: impl Into<String>, port: u16) -> Self {
         self.health_endpoint_ports.insert(service.into(), port);
         self
+    }
+
+    /// Configures the root directory used to inspect active slots and slot-bundled manifests.
+    pub fn with_muconde_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.muconde_root = Some(root.into());
+        self
+    }
+
+    fn probe_single_unit(&self, unit_name: &str) -> Result<(), String> {
+        let output = self
+            .runner
+            .run_command(
+                "systemctl",
+                &["show", "-p", "ActiveState,SubState", unit_name],
+            )
+            .map_err(|e| format!("{unit_name}: systemctl failed: {e}"))?;
+        let active = output.stdout.contains("ActiveState=active")
+            && (output.stdout.contains("SubState=running")
+                || output.stdout.contains("SubState=active"));
+        if active {
+            Ok(())
+        } else {
+            Err(format!("{unit_name}: {}", output.stdout.trim()))
+        }
+    }
+
+    fn check_static_web_slot(&self, root: &Path, service: &str) -> Result<(), String> {
+        let srv_dir = root.join(service);
+        let slot = read_active_slot_at(&srv_dir)
+            .map_err(|e| format!("failed reading active slot for '{service}': {e}"))?
+            .ok_or_else(|| format!("active slot symlink missing for static web '{service}'"))?;
+        let slot_dir = srv_dir.join(slot.as_str());
+        if !slot_dir.is_dir() {
+            return Err(format!(
+                "active slot directory '{}' missing for static web '{service}'",
+                slot_dir.display()
+            ));
+        }
+        if root == Path::new("/srv/muconde") && !slot_dir.join("dist").is_dir() {
+            return Err(format!(
+                "staged dist directory '{}' missing for static web '{service}'",
+                slot_dir.join("dist").display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn candidate_units_for_daemon(&self, service: &str) -> Vec<String> {
+        let mut units = Vec::new();
+        if let Some(ref root) = self.muconde_root {
+            let slot_current = root.join(service).join("current");
+            if let Ok(Some(manifest)) = MuCdManifest::load_optional_from_dir(&slot_current) {
+                if let Some(unit) = manifest.deployment.normalized_systemd_unit() {
+                    units.push(unit);
+                }
+            }
+        }
+        for unit in candidate_systemd_units(service) {
+            if !units.contains(&unit) {
+                units.push(unit);
+            }
+        }
+        units
     }
 }
 
@@ -73,33 +143,43 @@ impl HealthProber for SystemHealthProber {
     async fn probe(&self, service: &str) -> Result<ProbeResult, AgentError> {
         let start = Instant::now();
 
-        // 1. Probe systemd unit state
-        let unit_name = if service.ends_with(".service") {
-            service.to_string()
+        // 1. Probe systemd unit state (static web probes nginx.service + active slot layout;
+        //    daemons probe canonical and legacy unit aliases).
+        let (systemd_active, error_detail) = if is_static_web_service(service) {
+            match self.probe_single_unit("nginx.service") {
+                Ok(()) => {
+                    if let Some(ref root) = self.muconde_root {
+                        match self.check_static_web_slot(root, service) {
+                            Ok(()) => (true, None),
+                            Err(err) => (false, Some(err)),
+                        }
+                    } else {
+                        (true, None)
+                    }
+                }
+                Err(err) => (false, Some(format!("systemd unit state: {err}"))),
+            }
         } else {
-            format!("{}.service", service)
-        };
-
-        let cmd_res = self.runner.run_command(
-            "systemctl",
-            &["show", "-p", "ActiveState,SubState", &unit_name],
-        );
-
-        let (systemd_active, error_detail) = match cmd_res {
-            Ok(output) => {
-                let stdout = output.stdout;
-                let active = stdout.contains("ActiveState=active")
-                    && (stdout.contains("SubState=running") || stdout.contains("SubState=active"));
-                if !active {
-                    (
-                        false,
-                        Some(format!("systemd unit state: {}", stdout.trim())),
-                    )
-                } else {
-                    (true, None)
+            let candidates = self.candidate_units_for_daemon(service);
+            let mut failures = Vec::new();
+            let mut matched = false;
+            for unit in &candidates {
+                match self.probe_single_unit(unit) {
+                    Ok(()) => {
+                        matched = true;
+                        break;
+                    }
+                    Err(err) => failures.push(err),
                 }
             }
-            Err(e) => (false, Some(format!("systemctl failed: {}", e))),
+            if matched {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some(format!("systemd unit state: {}", failures.join("; "))),
+                )
+            }
         };
 
         // 2. Probe local health endpoint if configured
@@ -206,6 +286,8 @@ pub struct WatchdogMonitor {
     node_id: String,
     slot_manager: Arc<SlotManager>,
     prober: Arc<dyn HealthProber>,
+    deployment: Option<DeploymentConfig>,
+    cmd_systemd_unit: Option<String>,
 }
 
 impl WatchdogMonitor {
@@ -218,7 +300,20 @@ impl WatchdogMonitor {
             node_id: node_id.into(),
             slot_manager,
             prober,
+            deployment: None,
+            cmd_systemd_unit: None,
         }
+    }
+
+    /// Configures declarative [`DeploymentConfig`] and systemd unit overrides applied during rollback.
+    pub fn with_deployment(
+        mut self,
+        deployment: Option<DeploymentConfig>,
+        cmd_systemd_unit: Option<String>,
+    ) -> Self {
+        self.deployment = deployment;
+        self.cmd_systemd_unit = cmd_systemd_unit;
+        self
     }
 
     pub fn node_id(&self) -> &str {
@@ -238,8 +333,12 @@ impl WatchdogMonitor {
         let start = Instant::now();
 
         // 1. Immediately revert active slot to `restore_slot` (restoring prior read-only snapshot if needed)
-        self.slot_manager
-            .rollback_to_prior_slot(service, Some(restore_slot))?;
+        self.slot_manager.rollback_to_prior_slot_with_deployment(
+            service,
+            Some(restore_slot),
+            self.deployment.as_ref(),
+            self.cmd_systemd_unit.as_deref(),
+        )?;
 
         let elapsed_rollback_ms = start.elapsed().as_millis() as u64;
 
@@ -724,5 +823,54 @@ mod tests {
 
         assert_eq!(slot_mgr.read_active_slot(service).unwrap(), Some(Slot::B));
         drop(temp);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_system_health_prober_checks_nginx_for_static_web_and_aliases_for_daemons() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let runner = Arc::new(MockCommandRunner::new(true));
+        runner.set_command_output(
+            "systemctl show -p ActiveState,SubState nginx.service",
+            crate::btrfs::CommandOutput {
+                status: 0,
+                stdout: "ActiveState=active\nSubState=running\n".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let slot_mgr = SlotManager::new(&root, runner.clone());
+        std::fs::create_dir_all(root.join("mu-console/@a/dist")).unwrap();
+        slot_mgr
+            .atomic_swap_active_slot("mu-console", Slot::A)
+            .unwrap();
+
+        let prober = SystemHealthProber::new(runner.clone()).with_muconde_root(&root);
+        let static_res = prober.probe("mu-console").await.unwrap();
+        assert!(static_res.is_healthy());
+        assert!(
+            !runner
+                .recorded_calls()
+                .iter()
+                .any(|c| c.iter().any(|arg| arg == "mu-console.service")),
+            "Static web health probe must query nginx.service, never mu-console.service"
+        );
+
+        // Missing active slot fails closed even if nginx.service is running
+        let bad_res = prober.probe("mu-ci-web").await.unwrap();
+        assert!(!bad_res.systemd_active);
+
+        // Legacy daemon alias resolves via canonical unit when active
+        runner.set_command_output(
+            "systemctl show -p ActiveState,SubState mu-registry.service",
+            crate::btrfs::CommandOutput {
+                status: 0,
+                stdout: "ActiveState=active\nSubState=running\n".into(),
+                stderr: String::new(),
+            },
+        );
+        let daemon_res = prober.probe("muregist").await.unwrap();
+        assert!(daemon_res.is_healthy());
     }
 }
