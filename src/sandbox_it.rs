@@ -94,7 +94,7 @@ pub fn sanitize_and_bound_log_excerpt(raw: &str, max_bytes: usize) -> String {
     format!("{}{}", &trimmed[..cut], SUFFIX)
 }
 
-fn sanitize_relative_path(raw: &Path) -> Result<PathBuf, AgentError> {
+pub(crate) fn sanitize_relative_path(raw: &Path) -> Result<PathBuf, AgentError> {
     let mut clean = PathBuf::new();
     for component in raw.components() {
         match component {
@@ -420,14 +420,37 @@ pub fn resolve_gate_plan_with_base(
     Ok((expanded, custom_tests))
 }
 
+/// Artifact slot requested when fetching a digest-pinned payload from `mu-registry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryArtifactKind {
+    Binary,
+    ItArchive,
+}
+
+impl RegistryArtifactKind {
+    fn download_query(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::ItArchive => "it_archive",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Binary => "candidate artifact",
+            Self::ItArchive => "IT archive",
+        }
+    }
+}
+
 /// Abstraction for fetching verified IT archive bytes by SHA-256 digest.
 #[async_trait]
 pub trait ItArchiveFetcher: Send + Sync {
     async fn fetch_it_archive(&self, digest: &str) -> Result<Vec<u8>, AgentError>;
 }
 
-/// Fetches integration test archives from local CAS storage or `mu-registry` HTTP/mTLS endpoints,
-/// enforcing SHA-256 verification before returning bytes.
+/// Fetches candidate artifacts and integration test archives from local CAS storage or
+/// `mu-registry` HTTP/mTLS endpoints, enforcing SHA-256 verification before returning bytes.
 #[derive(Debug, Clone, Default)]
 pub struct RegistryAndCasFetcher {
     pub cas_dir: Option<PathBuf>,
@@ -448,6 +471,43 @@ impl RegistryAndCasFetcher {
     pub fn with_registry_url(mut self, registry_url: impl Into<String>) -> Self {
         self.registry_url = Some(registry_url.into());
         self
+    }
+
+    pub fn with_bundle_id(mut self, bundle_id: impl Into<String>) -> Self {
+        self.bundle_id = Some(bundle_id.into());
+        self
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    /// Fetch and verify any CAS blob or registered bundle artifact by exact SHA-256 digest.
+    pub async fn fetch_artifact_by_digest(
+        &self,
+        digest: &str,
+        preferred_kind: RegistryArtifactKind,
+    ) -> Result<Vec<u8>, AgentError> {
+        let digest = validate_sha256_digest(digest)?;
+        if let Some(bytes) = self.try_read_local_cas(&digest)? {
+            return Ok(bytes);
+        }
+        if let Some(ref registry_url) = self.registry_url {
+            return self
+                .fetch_from_registry(registry_url, &digest, preferred_kind)
+                .await;
+        }
+        Err(AgentError::BundleVerification(format!(
+            "{} {digest} not found in local CAS and no registry_url configured",
+            preferred_kind.label()
+        )))
+    }
+
+    /// Fetch and SHA-256-verify a candidate deployment artifact (binary or bundle tarball).
+    pub async fn fetch_candidate_artifact(&self, digest: &str) -> Result<Vec<u8>, AgentError> {
+        self.fetch_artifact_by_digest(digest, RegistryArtifactKind::Binary)
+            .await
     }
 
     fn try_read_local_cas(&self, digest: &str) -> Result<Option<Vec<u8>>, AgentError> {
@@ -506,6 +566,7 @@ impl RegistryAndCasFetcher {
         &self,
         base_url: &str,
         digest: &str,
+        preferred_kind: RegistryArtifactKind,
     ) -> Result<Vec<u8>, AgentError> {
         let client = self.build_http_client()?;
         let base = base_url.trim_end_matches('/');
@@ -515,20 +576,23 @@ impl RegistryAndCasFetcher {
             let trimmed_id = bundle_id.trim();
             if !trimmed_id.is_empty() {
                 candidate_urls.push(format!(
-                    "{base}/api/v1/bundles/it/{trimmed_id}?download=it_archive"
+                    "{base}/api/v1/bundles/it/{trimmed_id}?download={}",
+                    preferred_kind.download_query()
                 ));
             }
-        } else if let Some(resolved_id) = self
-            .lookup_bundle_id_by_digest(&client, base, digest)
+        } else if let Some((resolved_id, matched_kind)) = self
+            .lookup_bundle_id_by_digest(&client, base, digest, preferred_kind)
             .await?
         {
             candidate_urls.push(format!(
-                "{base}/api/v1/bundles/it/{resolved_id}?download=it_archive"
+                "{base}/api/v1/bundles/it/{resolved_id}?download={}",
+                matched_kind.download_query()
             ));
         }
 
         candidate_urls.push(format!("{base}/api/v1/cas/blobs/sha256/{digest}"));
         candidate_urls.push(format!("{base}/api/v1/blobs/sha256/{digest}"));
+        candidate_urls.push(format!("{base}/api/v1/blobs/{digest}"));
 
         let mut errors = Vec::new();
         for url in candidate_urls {
@@ -556,7 +620,8 @@ impl RegistryAndCasFetcher {
         }
 
         Err(AgentError::BundleVerification(format!(
-            "Unable to fetch IT archive {digest} from mu-registry ({})",
+            "Unable to fetch {} {digest} from mu-registry ({})",
+            preferred_kind.label(),
             errors.join("; ")
         )))
     }
@@ -566,7 +631,8 @@ impl RegistryAndCasFetcher {
         client: &reqwest::Client,
         base: &str,
         digest: &str,
-    ) -> Result<Option<String>, AgentError> {
+        preferred_kind: RegistryArtifactKind,
+    ) -> Result<Option<(String, RegistryArtifactKind)>, AgentError> {
         let url = format!("{base}/api/v1/registry/bundles");
         let mut req = client.get(&url);
         if let Some(ref token) = self.bearer_token {
@@ -587,14 +653,23 @@ impl RegistryAndCasFetcher {
         let Some(entries) = list else {
             return Ok(None);
         };
-        for item in entries {
-            let item_digest = item
-                .get("it_archive_digest")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if item_digest.eq_ignore_ascii_case(digest) {
-                if let Some(id) = item.get("bundle_id").and_then(|v| v.as_str()) {
-                    return Ok(Some(id.to_string()));
+        let search_order = match preferred_kind {
+            RegistryArtifactKind::Binary => [
+                ("binary_digest", RegistryArtifactKind::Binary),
+                ("it_archive_digest", RegistryArtifactKind::ItArchive),
+            ],
+            RegistryArtifactKind::ItArchive => [
+                ("it_archive_digest", RegistryArtifactKind::ItArchive),
+                ("binary_digest", RegistryArtifactKind::Binary),
+            ],
+        };
+        for (field, kind) in search_order {
+            for item in entries {
+                let item_digest = item.get(field).and_then(|v| v.as_str()).unwrap_or("");
+                if item_digest.eq_ignore_ascii_case(digest) {
+                    if let Some(id) = item.get("bundle_id").and_then(|v| v.as_str()) {
+                        return Ok(Some((id.to_string(), kind)));
+                    }
                 }
             }
         }
@@ -605,16 +680,8 @@ impl RegistryAndCasFetcher {
 #[async_trait]
 impl ItArchiveFetcher for RegistryAndCasFetcher {
     async fn fetch_it_archive(&self, digest: &str) -> Result<Vec<u8>, AgentError> {
-        let digest = validate_sha256_digest(digest)?;
-        if let Some(bytes) = self.try_read_local_cas(&digest)? {
-            return Ok(bytes);
-        }
-        if let Some(ref registry_url) = self.registry_url {
-            return self.fetch_from_registry(registry_url, &digest).await;
-        }
-        Err(AgentError::BundleVerification(format!(
-            "IT archive {digest} not found in local CAS and no registry_url configured"
-        )))
+        self.fetch_artifact_by_digest(digest, RegistryArtifactKind::ItArchive)
+            .await
     }
 }
 
@@ -1000,7 +1067,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_log_excerpt_redaction_and_bounding() {
-        let raw = "line1 token=super-secret-value Bearer secret-abc\n".repeat(400);
+        #[cfg(miri)]
+        const REPEATS: usize = 25;
+        #[cfg(not(miri))]
+        const REPEATS: usize = 400;
+        let raw = "line1 token=super-secret-value Bearer secret-abc\n".repeat(REPEATS);
         let scrubbed = sanitize_and_bound_log_excerpt(&raw, 512);
         assert!(scrubbed.len() <= 512);
         assert!(!scrubbed.contains("super-secret-value"));
@@ -1229,5 +1300,120 @@ profiles:
         assert!(out.log_output.contains("svc=mu-cd-agent slot=@b"));
         assert!(!out.log_output.contains("leak123"));
         assert!(out.log_output.contains(REDACTED_PLACEHOLDER));
+    }
+
+    async fn spawn_mock_registry_server<F>(handler: F) -> String
+    where
+        F: Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = std::sync::Arc::new(handler);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, content_type, body) = handler(path);
+                    let reason = match status {
+                        200 => "OK",
+                        404 => "Not Found",
+                        _ => "Error",
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_registry_fetcher_resolves_binary_and_it_archive_and_fails_closed() {
+        let bin_bytes = b"\x7fELF-candidate-binary-payload".to_vec();
+        let bin_digest = hex::encode(Sha256::digest(&bin_bytes));
+        let (it_bytes, it_digest) = build_test_tar_gz(&[(
+            "manifest.json",
+            br#"{"tests":[{"name":"it_smoke","command":"bin/run.sh","critical":true}]}"#,
+            0o644,
+        )]);
+        let cas_only_bytes = b"direct-cas-blob-payload".to_vec();
+        let cas_only_digest = hex::encode(Sha256::digest(&cas_only_bytes));
+        let bad_digest = "f".repeat(64);
+
+        let bin_digest_srv = bin_digest.clone();
+        let it_digest_srv = it_digest.clone();
+        let cas_digest_srv = cas_only_digest.clone();
+        let bin_bytes_srv = bin_bytes.clone();
+        let it_bytes_srv = it_bytes.clone();
+        let cas_bytes_srv = cas_only_bytes.clone();
+
+        let base_url = spawn_mock_registry_server(move |path| match path {
+            "/api/v1/registry/bundles" => {
+                let json = format!(
+                    r#"{{"total":1,"bundles":[{{"bundle_id":"bundle-42","service_name":"mu-cd-agent","binary_digest":"{bin_digest_srv}","it_archive_digest":"{it_digest_srv}"}}]}}"#
+                );
+                (200, "application/json", json.into_bytes())
+            }
+            "/api/v1/bundles/it/bundle-42?download=binary" => {
+                (200, "application/octet-stream", bin_bytes_srv.clone())
+            }
+            "/api/v1/bundles/it/bundle-42?download=it_archive" => {
+                (200, "application/gzip", it_bytes_srv.clone())
+            }
+            p if p == format!("/api/v1/cas/blobs/sha256/{cas_digest_srv}") => {
+                (200, "application/octet-stream", cas_bytes_srv.clone())
+            }
+            p if p.contains("ffffffff") => {
+                (200, "application/octet-stream", b"tampered-bytes".to_vec())
+            }
+            _ => (404, "text/plain", b"not found".to_vec()),
+        })
+        .await;
+
+        let fetcher = RegistryAndCasFetcher::default()
+            .with_registry_url(base_url)
+            .with_bearer_token("test-token");
+
+        let got_bin = fetcher.fetch_candidate_artifact(&bin_digest).await.unwrap();
+        assert_eq!(got_bin, bin_bytes);
+
+        let got_it = fetcher.fetch_it_archive(&it_digest).await.unwrap();
+        assert_eq!(got_it, it_bytes);
+
+        let got_cas = fetcher
+            .fetch_candidate_artifact(&cas_only_digest)
+            .await
+            .unwrap();
+        assert_eq!(got_cas, cas_only_bytes);
+
+        let mismatch_err = fetcher
+            .fetch_candidate_artifact(&bad_digest)
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatch_err, AgentError::BundleVerification(_)));
+
+        let missing_digest = "e".repeat(64);
+        let missing_err = fetcher
+            .fetch_candidate_artifact(&missing_digest)
+            .await
+            .unwrap_err();
+        assert!(matches!(missing_err, AgentError::BundleVerification(_)));
     }
 }

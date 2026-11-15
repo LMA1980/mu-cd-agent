@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,9 +15,10 @@ use mu_cd_ipc::{
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::btrfs::CommandRunner;
+use crate::btrfs::{candidate_systemd_units, is_static_web_service, CommandRunner};
 use crate::error::AgentError;
-use crate::slot::{Slot, SlotManager};
+use crate::manifest::{DeploymentConfig, MuCdManifest};
+use crate::slot::{read_active_slot_at, Slot, SlotManager};
 
 /// Current timestamp in milliseconds since Unix epoch.
 pub fn now_epoch_ms() -> u64 {
@@ -49,9 +51,13 @@ pub trait HealthProber: Send + Sync {
 
 /// Real system prober checking systemd unit state (`ActiveState=active && SubState=running`)
 /// and optional local health endpoint.
+///
+/// Static web services probe `nginx.service` and the active slot layout instead of a nonexistent
+/// `<web-service>.service` unit; daemon services probe canonical and aliased systemd units.
 pub struct SystemHealthProber {
     runner: Arc<dyn CommandRunner>,
     health_endpoint_ports: std::collections::HashMap<String, u16>,
+    muconde_root: Option<PathBuf>,
 }
 
 impl SystemHealthProber {
@@ -59,12 +65,76 @@ impl SystemHealthProber {
         Self {
             runner,
             health_endpoint_ports: std::collections::HashMap::new(),
+            muconde_root: None,
         }
     }
 
     pub fn with_endpoint(mut self, service: impl Into<String>, port: u16) -> Self {
         self.health_endpoint_ports.insert(service.into(), port);
         self
+    }
+
+    /// Configures the root directory used to inspect active slots and slot-bundled manifests.
+    pub fn with_muconde_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.muconde_root = Some(root.into());
+        self
+    }
+
+    fn probe_single_unit(&self, unit_name: &str) -> Result<(), String> {
+        let output = self
+            .runner
+            .run_command(
+                "systemctl",
+                &["show", "-p", "ActiveState,SubState", unit_name],
+            )
+            .map_err(|e| format!("{unit_name}: systemctl failed: {e}"))?;
+        let active = output.stdout.contains("ActiveState=active")
+            && (output.stdout.contains("SubState=running")
+                || output.stdout.contains("SubState=active"));
+        if active {
+            Ok(())
+        } else {
+            Err(format!("{unit_name}: {}", output.stdout.trim()))
+        }
+    }
+
+    fn check_static_web_slot(&self, root: &Path, service: &str) -> Result<(), String> {
+        let srv_dir = root.join(service);
+        let slot = read_active_slot_at(&srv_dir)
+            .map_err(|e| format!("failed reading active slot for '{service}': {e}"))?
+            .ok_or_else(|| format!("active slot symlink missing for static web '{service}'"))?;
+        let slot_dir = srv_dir.join(slot.as_str());
+        if !slot_dir.is_dir() {
+            return Err(format!(
+                "active slot directory '{}' missing for static web '{service}'",
+                slot_dir.display()
+            ));
+        }
+        if root == Path::new("/srv/muconde") && !slot_dir.join("dist").is_dir() {
+            return Err(format!(
+                "staged dist directory '{}' missing for static web '{service}'",
+                slot_dir.join("dist").display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn candidate_units_for_daemon(&self, service: &str) -> Vec<String> {
+        let mut units = Vec::new();
+        if let Some(ref root) = self.muconde_root {
+            let slot_current = root.join(service).join("current");
+            if let Ok(Some(manifest)) = MuCdManifest::load_optional_from_dir(&slot_current) {
+                if let Some(unit) = manifest.deployment.normalized_systemd_unit() {
+                    units.push(unit);
+                }
+            }
+        }
+        for unit in candidate_systemd_units(service) {
+            if !units.contains(&unit) {
+                units.push(unit);
+            }
+        }
+        units
     }
 }
 
@@ -73,33 +143,43 @@ impl HealthProber for SystemHealthProber {
     async fn probe(&self, service: &str) -> Result<ProbeResult, AgentError> {
         let start = Instant::now();
 
-        // 1. Probe systemd unit state
-        let unit_name = if service.ends_with(".service") {
-            service.to_string()
+        // 1. Probe systemd unit state (static web probes nginx.service + active slot layout;
+        //    daemons probe canonical and legacy unit aliases).
+        let (systemd_active, error_detail) = if is_static_web_service(service) {
+            match self.probe_single_unit("nginx.service") {
+                Ok(()) => {
+                    if let Some(ref root) = self.muconde_root {
+                        match self.check_static_web_slot(root, service) {
+                            Ok(()) => (true, None),
+                            Err(err) => (false, Some(err)),
+                        }
+                    } else {
+                        (true, None)
+                    }
+                }
+                Err(err) => (false, Some(format!("systemd unit state: {err}"))),
+            }
         } else {
-            format!("{}.service", service)
-        };
-
-        let cmd_res = self.runner.run_command(
-            "systemctl",
-            &["show", "-p", "ActiveState,SubState", &unit_name],
-        );
-
-        let (systemd_active, error_detail) = match cmd_res {
-            Ok(output) => {
-                let stdout = output.stdout;
-                let active = stdout.contains("ActiveState=active")
-                    && (stdout.contains("SubState=running") || stdout.contains("SubState=active"));
-                if !active {
-                    (
-                        false,
-                        Some(format!("systemd unit state: {}", stdout.trim())),
-                    )
-                } else {
-                    (true, None)
+            let candidates = self.candidate_units_for_daemon(service);
+            let mut failures = Vec::new();
+            let mut matched = false;
+            for unit in &candidates {
+                match self.probe_single_unit(unit) {
+                    Ok(()) => {
+                        matched = true;
+                        break;
+                    }
+                    Err(err) => failures.push(err),
                 }
             }
-            Err(e) => (false, Some(format!("systemctl failed: {}", e))),
+            if matched {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some(format!("systemd unit state: {}", failures.join("; "))),
+                )
+            }
         };
 
         // 2. Probe local health endpoint if configured
@@ -206,6 +286,8 @@ pub struct WatchdogMonitor {
     node_id: String,
     slot_manager: Arc<SlotManager>,
     prober: Arc<dyn HealthProber>,
+    deployment: Option<DeploymentConfig>,
+    cmd_systemd_unit: Option<String>,
 }
 
 impl WatchdogMonitor {
@@ -218,7 +300,20 @@ impl WatchdogMonitor {
             node_id: node_id.into(),
             slot_manager,
             prober,
+            deployment: None,
+            cmd_systemd_unit: None,
         }
+    }
+
+    /// Configures declarative [`DeploymentConfig`] and systemd unit overrides applied during rollback.
+    pub fn with_deployment(
+        mut self,
+        deployment: Option<DeploymentConfig>,
+        cmd_systemd_unit: Option<String>,
+    ) -> Self {
+        self.deployment = deployment;
+        self.cmd_systemd_unit = cmd_systemd_unit;
+        self
     }
 
     pub fn node_id(&self) -> &str {
@@ -235,11 +330,41 @@ impl WatchdogMonitor {
         candidate_artifact_sha256: &str,
         reason: &str,
     ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
+        self.execute_rollback_with_deployment(
+            deployment_id,
+            service,
+            restore_slot,
+            candidate_artifact_sha256,
+            reason,
+            self.deployment.as_ref(),
+            self.cmd_systemd_unit.as_deref(),
+        )
+    }
+
+    /// Autonomous sub-second (< 1s) rollback engine with explicit [`DeploymentConfig`] and
+    /// `systemd_unit` overrides.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_rollback_with_deployment(
+        &self,
+        deployment_id: &str,
+        service: &str,
+        restore_slot: Slot,
+        candidate_artifact_sha256: &str,
+        reason: &str,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
         let start = Instant::now();
+        let effective_deployment = deployment.or(self.deployment.as_ref());
+        let effective_unit = cmd_systemd_unit.or(self.cmd_systemd_unit.as_deref());
 
         // 1. Immediately revert active slot to `restore_slot` (restoring prior read-only snapshot if needed)
-        self.slot_manager
-            .rollback_to_prior_slot(service, Some(restore_slot))?;
+        self.slot_manager.rollback_to_prior_slot_with_deployment(
+            service,
+            Some(restore_slot),
+            effective_deployment,
+            effective_unit,
+        )?;
 
         let elapsed_rollback_ms = start.elapsed().as_millis() as u64;
 
@@ -289,22 +414,53 @@ impl WatchdogMonitor {
         &self,
         cmd: &RollbackCommand,
     ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
-        self.execute_rollback(
+        self.handle_rollback_command_with_deployment(cmd, None, None)
+    }
+
+    /// Handles an explicit `RollbackCommand` while applying explicit [`DeploymentConfig`] and
+    /// `systemd_unit` overrides.
+    pub fn handle_rollback_command_with_deployment(
+        &self,
+        cmd: &RollbackCommand,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
+        self.execute_rollback_with_deployment(
             &cmd.deployment_id,
             &cmd.service_name,
             Slot::from(cmd.restore_slot),
             &cmd.failed_artifact_sha256,
             &cmd.reason,
+            deployment,
+            cmd_systemd_unit,
         )
     }
 
-    /// Runs a bounded post-swap warmup watchdog monitor:
-    /// - Checks health at 250ms intervals.
-    /// - Emits `HealthProbeTelemetry` per probe tick over `telemetry_tx`.
-    /// - Autonomously executes instant rollback to `command.from_slot` (< 1s) upon:
-    ///   - Any unhealthy probe or process exit/crash.
-    ///   - Deployment lease TTL expiration without controller promotion.
-    ///   - External rollback signal via `rollback_rx`.
+    fn rolled_back_outcome(
+        &self,
+        command: &SlotSwapCommand,
+        restore_slot: Slot,
+        candidate_artifact_sha256: &str,
+        reason: &str,
+        deployment: Option<&DeploymentConfig>,
+    ) -> Result<WatchdogOutcome, AgentError> {
+        let (report, taint, elapsed_rollback_ms) = self.execute_rollback_with_deployment(
+            &command.deployment_id,
+            &command.service_name,
+            restore_slot,
+            candidate_artifact_sha256,
+            reason,
+            deployment,
+            Some(command.systemd_unit.as_str()),
+        )?;
+        Ok(WatchdogOutcome::RolledBack {
+            report: Box::new(report),
+            taint: Box::new(taint),
+            elapsed_rollback_ms,
+        })
+    }
+
+    /// Runs a bounded post-swap warmup watchdog monitor using default configured deployment overrides.
     pub async fn monitor_warmup(
         &self,
         command: &SlotSwapCommand,
@@ -312,7 +468,38 @@ impl WatchdogMonitor {
         expires_at_epoch_ms: u64,
         required_consecutive_successes: u32,
         telemetry_tx: Option<mpsc::Sender<HealthProbeTelemetry>>,
+        rollback_rx: Option<mpsc::Receiver<String>>,
+    ) -> Result<WatchdogOutcome, AgentError> {
+        self.monitor_warmup_with_deployment(
+            command,
+            candidate_artifact_sha256,
+            expires_at_epoch_ms,
+            required_consecutive_successes,
+            telemetry_tx,
+            rollback_rx,
+            None,
+        )
+        .await
+    }
+
+    /// Runs a bounded post-swap warmup watchdog monitor while applying explicit [`DeploymentConfig`]
+    /// and `command.systemd_unit` overrides to any triggered rollback:
+    /// - Checks health at 250ms intervals.
+    /// - Emits `HealthProbeTelemetry` per probe tick over `telemetry_tx`.
+    /// - Autonomously executes instant rollback to `command.from_slot` (< 1s) upon:
+    ///   - Any unhealthy probe or process exit/crash.
+    ///   - Deployment lease TTL expiration without controller promotion.
+    ///   - External rollback signal via `rollback_rx`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn monitor_warmup_with_deployment(
+        &self,
+        command: &SlotSwapCommand,
+        candidate_artifact_sha256: &str,
+        expires_at_epoch_ms: u64,
+        required_consecutive_successes: u32,
+        telemetry_tx: Option<mpsc::Sender<HealthProbeTelemetry>>,
         mut rollback_rx: Option<mpsc::Receiver<String>>,
+        deployment: Option<DeploymentConfig>,
     ) -> Result<WatchdogOutcome, AgentError> {
         let warmup_duration = Duration::from_secs(command.warmup_timeout_secs);
         let deadline = Instant::now() + warmup_duration;
@@ -331,18 +518,13 @@ impl WatchdogMonitor {
                         None => std::future::pending().await,
                     }
                 } => {
-                    let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                        &command.deployment_id,
-                        &command.service_name,
+                    return self.rolled_back_outcome(
+                        command,
                         restore_slot,
                         candidate_artifact_sha256,
                         &format!("External rollback requested: {}", reason),
-                    )?;
-                    return Ok(WatchdogOutcome::RolledBack {
-                        report: Box::new(report),
-                        taint: Box::new(taint),
-                        elapsed_rollback_ms,
-                    });
+                        deployment.as_ref(),
+                    );
                 }
 
                 _ = ticker.tick() => {
@@ -355,18 +537,13 @@ impl WatchdogMonitor {
                             "Deployment lease TTL expired at {} ms (now: {} ms) without promotion",
                             expires_at_epoch_ms, current_time_ms
                         );
-                        let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                            &command.deployment_id,
-                            &command.service_name,
+                        return self.rolled_back_outcome(
+                            command,
                             restore_slot,
                             candidate_artifact_sha256,
                             &reason,
-                        )?;
-                        return Ok(WatchdogOutcome::RolledBack {
-                            report: Box::new(report),
-                            taint: Box::new(taint),
-                            elapsed_rollback_ms,
-                        });
+                            deployment.as_ref(),
+                        );
                     }
 
                     // 2. Execute health probe
@@ -398,19 +575,13 @@ impl WatchdogMonitor {
                             probe_res.systemd_active, probe_res.health_endpoint_ok, detail
                         );
 
-                        let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                            &command.deployment_id,
-                            &command.service_name,
+                        return self.rolled_back_outcome(
+                            command,
                             restore_slot,
                             candidate_artifact_sha256,
                             &reason,
-                        )?;
-
-                        return Ok(WatchdogOutcome::RolledBack {
-                            report: Box::new(report),
-                            taint: Box::new(taint),
-                            elapsed_rollback_ms,
-                        });
+                            deployment.as_ref(),
+                        );
                     }
 
                     // Probe was healthy
@@ -436,18 +607,13 @@ impl WatchdogMonitor {
                             "Warmup timeout ({}s) elapsed before achieving {} consecutive healthy probes (got {})",
                             command.warmup_timeout_secs, required_consecutive_successes, consecutive_successes
                         );
-                        let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                            &command.deployment_id,
-                            &command.service_name,
+                        return self.rolled_back_outcome(
+                            command,
                             restore_slot,
                             candidate_artifact_sha256,
                             &reason,
-                        )?;
-                        return Ok(WatchdogOutcome::RolledBack {
-                            report: Box::new(report),
-                            taint: Box::new(taint),
-                            elapsed_rollback_ms,
-                        });
+                            deployment.as_ref(),
+                        );
                     }
                 }
             }
@@ -643,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_handle_rollback_command_direct() {
         let service = "muconde-agent";
         let (_temp, slot_mgr, _runner) = setup_env(service);
@@ -724,5 +891,54 @@ mod tests {
 
         assert_eq!(slot_mgr.read_active_slot(service).unwrap(), Some(Slot::B));
         drop(temp);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_system_health_prober_checks_nginx_for_static_web_and_aliases_for_daemons() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let runner = Arc::new(MockCommandRunner::new(true));
+        runner.set_command_output(
+            "systemctl show -p ActiveState,SubState nginx.service",
+            crate::btrfs::CommandOutput {
+                status: 0,
+                stdout: "ActiveState=active\nSubState=running\n".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let slot_mgr = SlotManager::new(&root, runner.clone());
+        std::fs::create_dir_all(root.join("mu-console/@a/dist")).unwrap();
+        slot_mgr
+            .atomic_swap_active_slot("mu-console", Slot::A)
+            .unwrap();
+
+        let prober = SystemHealthProber::new(runner.clone()).with_muconde_root(&root);
+        let static_res = prober.probe("mu-console").await.unwrap();
+        assert!(static_res.is_healthy());
+        assert!(
+            !runner
+                .recorded_calls()
+                .iter()
+                .any(|c| c.iter().any(|arg| arg == "mu-console.service")),
+            "Static web health probe must query nginx.service, never mu-console.service"
+        );
+
+        // Missing active slot fails closed even if nginx.service is running
+        let bad_res = prober.probe("mu-ci-web").await.unwrap();
+        assert!(!bad_res.systemd_active);
+
+        // Legacy daemon alias resolves via canonical unit when active
+        runner.set_command_output(
+            "systemctl show -p ActiveState,SubState mu-registry.service",
+            crate::btrfs::CommandOutput {
+                status: 0,
+                stdout: "ActiveState=active\nSubState=running\n".into(),
+                stderr: String::new(),
+            },
+        );
+        let daemon_res = prober.probe("muregist").await.unwrap();
+        assert!(daemon_res.is_healthy());
     }
 }

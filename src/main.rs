@@ -75,10 +75,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|m| m.ab_rules.clone())
         .unwrap_or_default();
 
+    let env_lookup = |key: &str| std::env::var(key).ok();
+    let registry_url = resolve_registry_url(&env_lookup);
+    let registry_token = resolve_registry_token(&env_lookup);
+    let cas_blobs_dir = resolve_cas_blobs_dir(&env_lookup);
+
     let config = MuConDeAgentConfig {
         node_id,
         listen_addr,
-        muconde_root,
+        muconde_root: muconde_root.clone(),
         tls_ca_path,
         tls_cert_path,
         tls_key_path,
@@ -92,18 +97,133 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .or(manifest_digest),
         it_bundle_id: std::env::var("MUCONDE_IT_BUNDLE_ID").ok(),
-        registry_url: std::env::var("MUCONDE_REGISTRY_URL").ok(),
-        cas_blobs_dir: std::env::var("MUCONDE_CAS_BLOBS_DIR")
-            .ok()
-            .map(PathBuf::from),
+        registry_url,
+        registry_token,
+        cas_blobs_dir,
         ..MuConDeAgentConfig::default()
     };
 
     let runner = Arc::new(SystemCommandRunner::new());
-    let prober = Arc::new(SystemHealthProber::new(runner.clone()));
+    let prober = Arc::new(SystemHealthProber::new(runner.clone()).with_muconde_root(&muconde_root));
     let agent = MuConDeAgent::new(config, runner, prober);
 
     agent.run().await?;
 
     Ok(())
+}
+
+fn first_non_empty_var<'a>(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    keys: &[&'a str],
+) -> Option<String> {
+    for key in keys {
+        if let Some(val) = lookup(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_registry_url(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    first_non_empty_var(lookup, &["MUCONDE_REGISTRY_URL", "MUREGIST_URL"])
+}
+
+fn resolve_cas_blobs_dir(lookup: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    first_non_empty_var(lookup, &["MUCONDE_CAS_BLOBS_DIR", "MUREGIST_CAS_BLOBS_DIR"])
+        .map(PathBuf::from)
+}
+
+fn resolve_registry_token(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(path) = first_non_empty_var(
+        lookup,
+        &["MUCONDE_REGISTRY_TOKEN_FILE", "MUREGIST_TOKEN_FILE"],
+    ) {
+        return std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if let Some(raw) = first_non_empty_var(lookup, &["MUCONDE_REGISTRY_TOKEN", "MUREGIST_TOKEN"]) {
+        if raw.starts_with('/') {
+            return std::fs::read_to_string(&raw)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        return Some(raw);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_registry_and_cas_env_fallback_precedence() {
+        let map_fallback = HashMap::from([
+            ("MUREGIST_URL", "https://registry.example:8444"),
+            ("MUREGIST_CAS_BLOBS_DIR", "/var/lib/muregist"),
+        ]);
+        let lookup_fb = |k: &str| map_fallback.get(k).map(|v| (*v).to_string());
+        assert_eq!(
+            resolve_registry_url(&lookup_fb).as_deref(),
+            Some("https://registry.example:8444")
+        );
+        assert_eq!(
+            resolve_cas_blobs_dir(&lookup_fb),
+            Some(PathBuf::from("/var/lib/muregist"))
+        );
+
+        let map_primary = HashMap::from([
+            ("MUCONDE_REGISTRY_URL", "https://primary.example:8444"),
+            ("MUREGIST_URL", "https://legacy.example:8444"),
+            ("MUCONDE_CAS_BLOBS_DIR", "/srv/cas"),
+            ("MUREGIST_CAS_BLOBS_DIR", "/var/lib/muregist"),
+        ]);
+        let lookup_pri = |k: &str| map_primary.get(k).map(|v| (*v).to_string());
+        assert_eq!(
+            resolve_registry_url(&lookup_pri).as_deref(),
+            Some("https://primary.example:8444")
+        );
+        assert_eq!(
+            resolve_cas_blobs_dir(&lookup_pri),
+            Some(PathBuf::from("/srv/cas"))
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_resolve_registry_token_file_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let token_path = temp.path().join("token");
+        std::fs::write(&token_path, "secret-token-123\n").unwrap();
+
+        let map_good = HashMap::from([(
+            "MUREGIST_TOKEN_FILE",
+            token_path.to_str().unwrap().to_string(),
+        )]);
+        assert_eq!(
+            resolve_registry_token(&|k| map_good.get(k).cloned()).as_deref(),
+            Some("secret-token-123")
+        );
+
+        let map_missing =
+            HashMap::from([("MUCONDE_REGISTRY_TOKEN_FILE", "/nonexistent/secret/token")]);
+        assert_eq!(
+            resolve_registry_token(&|k| map_missing.get(k).map(|v| (*v).to_string())),
+            None
+        );
+
+        let map_missing_path_literal =
+            HashMap::from([("MUREGIST_TOKEN", "/nonexistent/secret/token")]);
+        assert_eq!(
+            resolve_registry_token(&|k| map_missing_path_literal.get(k).map(|v| (*v).to_string())),
+            None
+        );
+    }
 }

@@ -5,6 +5,7 @@ target_nodes:
   - "node-a"
   - "node-b"
   - "worker-riscv64"
+  - "worker-aarch64"
 
 lease_ttl_seconds: 300
 warmup_timeout_seconds: 30
@@ -23,6 +24,7 @@ deployment:
     - "node-a"
     - "node-b"
     - "worker-riscv64"
+    - "worker-aarch64"
   binary: "mu-cd-agent"
   install_path: "/usr/local/bin/mu-cd-agent"
   systemd_unit: "mu-cd-agent.service"

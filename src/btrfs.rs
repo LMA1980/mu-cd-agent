@@ -4,17 +4,27 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::read::GzDecoder;
 use mu_cd_ipc::{DeploymentSlot, StageDeploymentRequest, StageDeploymentResponse};
 use serde::{Deserialize, Serialize};
+use tar::{Archive, EntryType};
+use uuid::Uuid;
 
 use crate::error::AgentError;
 use crate::manifest::AbRulesConfig;
+use crate::sandbox_it::{
+    sanitize_relative_path, validate_sha256_digest, verify_sha256_bytes, RegistryAndCasFetcher,
+};
 use crate::slot::{read_active_slot_at, Slot};
+
+const MAX_STATIC_WEB_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+const STATIC_WEB_ARCHIVE_STAGING_DIR: &str = ".dist-staging";
 
 const ARTIFACT_DIGEST_MARKER: &str = ".artifact_sha256";
 const RETENTION_MANIFEST_FILE: &str = ".retention.json";
@@ -69,6 +79,51 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
+fn write_file_atomic(dest: &Path, bytes: &[u8], mode: u32) -> Result<(), AgentError> {
+    let parent = dest.parent().ok_or_else(|| {
+        AgentError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Destination path '{}' has no parent directory",
+                dest.display()
+            ),
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact");
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+
+    if let Err(err) = (|| -> Result<(), AgentError> {
+        fs::write(&tmp_path, bytes)?;
+        let mut perms = fs::metadata(&tmp_path)?.permissions();
+        perms.set_mode(mode);
+        fs::set_permissions(&tmp_path, perms)?;
+        fs::rename(&tmp_path, dest)?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn validate_git_commit_sha(raw: &str) -> Result<String, AgentError> {
+    let trimmed = raw.trim();
+    if !(trimmed.len() == 40 || trimmed.len() == 64)
+        || !trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(AgentError::BundleVerification(format!(
+            "Invalid pinned git_commit '{raw}': expected full 40- or 64-character hex commit SHA"
+        )));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
 /// Permitted platform service binaries managed by `mu-cd-agent`.
 ///
 /// Strictly scoped to platform application binaries — never the full host OS rootfs.
@@ -85,6 +140,7 @@ pub const ALLOWED_SERVICES: &[&str] = &[
     "muconde-agent",
     "muconde-controller",
     "muobserve",
+    "muobservectl",
     "muobserve-collector",
     "muobserve-sentinel",
     "model-runner",
@@ -110,29 +166,77 @@ pub fn is_static_web_service(service: &str) -> bool {
 }
 
 /// Maps a logical or M8-aligned service name to candidate host binary names under `/usr/local/bin`.
+///
+/// Canonical `mu-*` binary names are always returned first, with legacy names preserved strictly
+/// as secondary aliases during transition.
 pub fn candidate_binary_names(service: &str) -> &'static [&'static str] {
     match service {
         "action-runner" | "action-runner-worker" | "mu-ci-worker" => {
             &["mu-ci-worker", "action-runner"]
         }
         "action-runner-controller" | "mu-ci-controller" => {
-            &["action-runner-controller", "mu-ci-controller"]
+            &["mu-ci-controller", "action-runner-controller"]
         }
-        "muregist" | "mu-registry" => &["muregist", "mu-registry"],
+        "muregist" | "mu-registry" => &["mu-registry", "muregist"],
         "muconde-agent" | "mu-cd-agent" => &["mu-cd-agent", "muconde-agent"],
         "muconde-controller" | "mu-cd-controller" => &["mu-cd-controller", "muconde-controller"],
-        "muobserve" | "mu-observable-hub" => &["muobservectl", "muobserve", "mu-observable-hub"],
-        "muobserve-collector" | "mu-observable-collector" => {
-            &["muobserve-collector", "mu-observable-collector"]
+        "muobserve" | "muobservectl" | "mu-observable-hub" => {
+            &["mu-observable-hub", "muobservectl", "muobserve"]
         }
+        "muobserve-collector" | "mu-observable-collector" => &[
+            "mu-observable-collector",
+            "muobserve-collector",
+            "muobserve-sentinel",
+        ],
         "muobserve-sentinel" | "mu-observable-sentinel" => {
-            &["muobserve-sentinel", "mu-observable-sentinel"]
+            &["mu-observable-sentinel", "muobserve-sentinel"]
         }
         "model-runner" | "jero-runner" | "k3-manager" | "jero-manager" => {
             &["k3-manager", "model-runner", "jero-runner"]
         }
         _ => &[],
     }
+}
+
+/// Returns candidate systemd unit names in priority order (canonical `mu-*` first, legacy secondary).
+/// Static web services resolve to `nginx.service`.
+pub fn candidate_systemd_units(service: &str) -> Vec<String> {
+    if is_static_web_service(service) {
+        return vec!["nginx.service".to_string()];
+    }
+    let trimmed = service.trim().trim_end_matches(".service");
+    let names: &[&str] = match trimmed {
+        "action-runner" | "action-runner-worker" | "mu-ci-worker" => {
+            &["mu-ci-worker", "action-runner", "action-runner-worker"]
+        }
+        "action-runner-controller" | "mu-ci-controller" => {
+            &["mu-ci-controller", "action-runner-controller"]
+        }
+        "muregist" | "mu-registry" => &["mu-registry", "muregist"],
+        "muconde-agent" | "mu-cd-agent" => &["mu-cd-agent", "muconde-agent"],
+        "muconde-controller" | "mu-cd-controller" => &["mu-cd-controller", "muconde-controller"],
+        "muobserve" | "muobservectl" | "mu-observable-hub" => {
+            &["mu-observable-hub", "muobserve", "muobservectl"]
+        }
+        "muobserve-collector" | "mu-observable-collector" => &[
+            "mu-observable-collector",
+            "muobserve-collector",
+            "muobserve-sentinel",
+        ],
+        "muobserve-sentinel" | "mu-observable-sentinel" => {
+            &["mu-observable-sentinel", "muobserve-sentinel"]
+        }
+        "k3-manager" | "jero-manager" => &["k3-manager", "jero-manager"],
+        other => &[other],
+    };
+    let mut units = Vec::with_capacity(names.len());
+    for name in names {
+        let unit = format!("{name}.service");
+        if !units.contains(&unit) {
+            units.push(unit);
+        }
+    }
+    units
 }
 
 /// Validates a service name against path-traversal patterns and the platform allowlist.
@@ -211,6 +315,7 @@ pub struct MockCommandRunner {
     pub calls: Arc<Mutex<Vec<Vec<String>>>>,
     pub simulate_fs: bool,
     pub fail_command_prefix: Option<String>,
+    pub command_outputs: Arc<Mutex<Vec<(String, CommandOutput)>>>,
 }
 
 impl MockCommandRunner {
@@ -219,6 +324,7 @@ impl MockCommandRunner {
             calls: Arc::new(Mutex::new(Vec::new())),
             simulate_fs,
             fail_command_prefix: None,
+            command_outputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -227,7 +333,16 @@ impl MockCommandRunner {
             calls: Arc::new(Mutex::new(Vec::new())),
             simulate_fs: false,
             fail_command_prefix: Some(prefix.into()),
+            command_outputs: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Registers a canned [`CommandOutput`] returned when the formatted command starts with `prefix`.
+    pub fn set_command_output(&self, prefix: impl Into<String>, output: CommandOutput) {
+        self.command_outputs
+            .lock()
+            .unwrap()
+            .push((prefix.into(), output));
     }
 
     pub fn recorded_calls(&self) -> Vec<Vec<String>> {
@@ -252,6 +367,25 @@ impl CommandRunner for MockCommandRunner {
                     stderr: "Simulated command failure".into(),
                 });
             }
+        }
+
+        if let Some((_, output)) = self
+            .command_outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(prefix, _)| cmd_line.starts_with(prefix.as_str()))
+            .cloned()
+        {
+            if output.status != 0 {
+                return Err(AgentError::CommandFailed {
+                    command: cmd_line,
+                    exit_code: Some(output.status),
+                    stderr: output.stderr,
+                });
+            }
+            return Ok(output);
         }
 
         if self.simulate_fs {
@@ -459,6 +593,8 @@ pub struct BtrfsManager {
     root_dir: PathBuf,
     runner: Arc<dyn CommandRunner>,
     ab_rules: AbRulesConfig,
+    cas_blobs_dir: Option<PathBuf>,
+    artifact_fetcher: Option<RegistryAndCasFetcher>,
 }
 
 impl BtrfsManager {
@@ -467,6 +603,8 @@ impl BtrfsManager {
             root_dir: root_dir.into(),
             runner,
             ab_rules: AbRulesConfig::default(),
+            cas_blobs_dir: None,
+            artifact_fetcher: None,
         }
     }
 
@@ -474,6 +612,45 @@ impl BtrfsManager {
     pub fn with_ab_rules(mut self, ab_rules: AbRulesConfig) -> Self {
         self.ab_rules = ab_rules;
         self
+    }
+
+    /// Configures a local CAS blob directory for fail-closed artifact resolution.
+    pub fn with_cas_blobs_dir(mut self, cas_blobs_dir: Option<PathBuf>) -> Self {
+        self.cas_blobs_dir = cas_blobs_dir;
+        self
+    }
+
+    /// Configures a [`RegistryAndCasFetcher`] for verified remote/CAS candidate downloads.
+    pub fn with_artifact_fetcher(mut self, fetcher: RegistryAndCasFetcher) -> Self {
+        self.artifact_fetcher = Some(fetcher);
+        self
+    }
+
+    fn effective_artifact_fetcher(&self) -> Option<RegistryAndCasFetcher> {
+        let fallback_cas = self.cas_blobs_dir.clone().or_else(|| {
+            if self.root_dir == Path::new("/srv/muconde") {
+                let default_cas = PathBuf::from("/var/lib/muregist");
+                if default_cas.is_dir() {
+                    return Some(default_cas);
+                }
+            }
+            None
+        });
+
+        match self.artifact_fetcher {
+            Some(ref fetcher) => {
+                let mut cloned = fetcher.clone();
+                if cloned.cas_dir.is_none() {
+                    cloned.cas_dir = fallback_cas;
+                }
+                if cloned.cas_dir.is_none() && cloned.registry_url.is_none() {
+                    None
+                } else {
+                    Some(cloned)
+                }
+            }
+            None => fallback_cas.map(|cas| RegistryAndCasFetcher::default().with_cas_dir(cas)),
+        }
     }
 
     pub fn ab_rules(&self) -> &AbRulesConfig {
@@ -698,10 +875,17 @@ impl BtrfsManager {
         self.runner
             .run_command("btrfs", &["subvolume", "create", candidate_str])?;
 
+        if !candidate_binary_path.is_file() {
+            return Err(AgentError::BundleVerification(format!(
+                "Candidate artifact for service '{service}' does not exist at '{}'",
+                candidate_binary_path.display()
+            )));
+        }
+
         let bin_dir = candidate_slot_dir.join("bin");
         fs::create_dir_all(&bin_dir)?;
 
-        // 4. Install candidate binary into <candidate_slot>/bin/<service> using install -m 755
+        // 4. Install candidate artifact into <candidate_slot>/bin/<service> using install -m 755
         let target_binary = bin_dir.join(service);
         let cand_str = candidate_binary_path.to_str().unwrap_or("");
         let target_str = target_binary.to_str().unwrap_or("");
@@ -716,14 +900,27 @@ impl BtrfsManager {
         }
 
         if !digest.trim().is_empty() && candidate_slot_dir.is_dir() {
-            let _ = fs::write(
-                candidate_slot_dir.join(ARTIFACT_DIGEST_MARKER),
-                digest.trim(),
-            );
+            write_file_atomic(
+                &candidate_slot_dir.join(ARTIFACT_DIGEST_MARKER),
+                digest.trim().as_bytes(),
+                0o644,
+            )?;
         }
 
-        if is_static_web_service(service) && self.root_dir == Path::new("/srv/muconde") {
-            let _ = self.stage_static_web_bundle(service, &candidate_slot_dir);
+        if is_static_web_service(service) {
+            if self.root_dir == Path::new("/srv/muconde") {
+                validate_sha256_digest(digest)?;
+            }
+            let expected_sha = if validate_sha256_digest(digest).is_ok() {
+                Some(digest.trim())
+            } else {
+                None
+            };
+            self.stage_static_web_bundle_archive(
+                candidate_binary_path,
+                expected_sha,
+                &candidate_slot_dir,
+            )?;
         }
 
         tracing::info!(
@@ -732,7 +929,7 @@ impl BtrfsManager {
             staged_slot = candidate_slot.as_str(),
             target = %target_binary.display(),
             pruned_count = pruned_snapshots.len(),
-            "Successfully staged candidate binary into symmetric candidate slot"
+            "Successfully staged candidate artifact into symmetric candidate slot"
         );
 
         Ok(PreparedStaging {
@@ -744,111 +941,278 @@ impl BtrfsManager {
         })
     }
 
-    /// Synchronizes static web frontend assets (`dist/`) from the local Git checkout into `slot_dir/dist`.
+    /// Safely verifies and extracts a static web `.tar.gz` bundle into `slot_dir/dist`.
+    pub fn stage_static_web_bundle_archive(
+        &self,
+        archive_path: &Path,
+        expected_sha256: Option<&str>,
+        slot_dir: &Path,
+    ) -> Result<(), AgentError> {
+        let archive_bytes = fs::read(archive_path)?;
+        if let Some(expected) = expected_sha256 {
+            verify_sha256_bytes(&archive_bytes, expected)?;
+        }
+
+        let staging_dir = slot_dir.join(format!(
+            "{STATIC_WEB_ARCHIVE_STAGING_DIR}-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&staging_dir)?;
+
+        let unpack_result = (|| -> Result<(), AgentError> {
+            let gz = GzDecoder::new(&archive_bytes[..]);
+            let mut archive = Archive::new(gz);
+            let mut total_bytes: u64 = 0;
+            let mut file_count: usize = 0;
+
+            let entries = archive.entries().map_err(|e| {
+                AgentError::BundleVerification(format!(
+                    "Invalid gzip tar static web archive '{}': {e}",
+                    archive_path.display()
+                ))
+            })?;
+
+            for entry in entries {
+                let mut entry = entry.map_err(|e| {
+                    AgentError::BundleVerification(format!(
+                        "Corrupt entry in static web archive '{}': {e}",
+                        archive_path.display()
+                    ))
+                })?;
+                let entry_type = entry.header().entry_type();
+                if matches!(entry_type, EntryType::Symlink | EntryType::Link) {
+                    return Err(AgentError::BundleVerification(
+                        "Static web archive must not contain symlinks or hardlinks".into(),
+                    ));
+                }
+
+                let rel = entry.path().map_err(|e| {
+                    AgentError::BundleVerification(format!("Invalid tar path entry: {e}"))
+                })?;
+                let clean_rel = sanitize_relative_path(&rel)?;
+                if clean_rel.as_os_str().is_empty() {
+                    continue;
+                }
+
+                let dest = staging_dir.join(&clean_rel);
+                if entry_type.is_dir() {
+                    fs::create_dir_all(&dest)?;
+                } else if entry_type.is_file() {
+                    let size = entry.header().size().map_err(|e| {
+                        AgentError::BundleVerification(format!("Invalid archive entry size: {e}"))
+                    })?;
+                    total_bytes = total_bytes.saturating_add(size);
+                    if total_bytes > MAX_STATIC_WEB_ARCHIVE_BYTES {
+                        return Err(AgentError::BundleVerification(format!(
+                            "Static web archive exceeds maximum unpacked size ({MAX_STATIC_WEB_ARCHIVE_BYTES} bytes)"
+                        )));
+                    }
+                    let mut buf = Vec::with_capacity(size.min(1024 * 1024) as usize);
+                    entry.read_to_end(&mut buf)?;
+                    write_file_atomic(&dest, &buf, 0o644)?;
+                    file_count += 1;
+                } else {
+                    return Err(AgentError::BundleVerification(format!(
+                        "Unsupported entry type {:?} in static web archive '{}'",
+                        entry_type,
+                        clean_rel.display()
+                    )));
+                }
+            }
+
+            if file_count == 0 {
+                return Err(AgentError::BundleVerification(format!(
+                    "Static web archive '{}' contained no regular files",
+                    archive_path.display()
+                )));
+            }
+
+            let nested_dist = staging_dir.join("dist");
+            let single_top_level_dist = nested_dist.is_dir()
+                && fs::read_dir(&staging_dir)?
+                    .filter_map(Result::ok)
+                    .all(|e| e.file_name() == "dist");
+
+            let final_dist = slot_dir.join("dist");
+            if final_dist.exists() {
+                fs::remove_dir_all(&final_dist)?;
+            }
+            if single_top_level_dist {
+                fs::rename(&nested_dist, &final_dist)?;
+                let _ = fs::remove_dir_all(&staging_dir);
+            } else {
+                fs::rename(&staging_dir, &final_dist)?;
+            }
+            Ok(())
+        })();
+
+        if unpack_result.is_err() && staging_dir.exists() {
+            let _ = fs::remove_dir_all(&staging_dir);
+        }
+        unpack_result
+    }
+
+    /// Synchronizes pinned static web frontend assets (`dist/`) into `slot_dir/dist` from a
+    /// verified exact Git commit (`git_commit`), failing closed if the commit cannot be checked out
+    /// or verified via `git rev-parse HEAD`. Never fetches or resets against floating `origin/main`.
     pub fn stage_static_web_bundle(
         &self,
         service: &str,
         slot_dir: &Path,
+        git_commit: &str,
     ) -> Result<(), AgentError> {
         let repo_candidates: &[&str] = match service {
             "muconsole" | "mu-console" => &[
-                "/home/lma1980/repository/MuConsole",
                 "/home/lma1980/repository/mu-console",
                 "/var/lib/action-runner/workspace/repos/LMA1980/mu-console",
+                "/home/lma1980/repository/MuConsole",
             ],
             "action-runner-web" | "mu-ci-web" => &[
-                "/home/lma1980/repository/ActionRunner-web",
                 "/home/lma1980/repository/mu-ci-web",
                 "/var/lib/action-runner/workspace/repos/LMA1980/mu-ci-web",
+                "/home/lma1980/repository/ActionRunner-web",
             ],
             _ => &[],
         };
-
-        for repo in repo_candidates {
-            let repo_path = Path::new(repo);
-            if repo_path.join(".git").exists() {
-                let _ = self
-                    .runner
-                    .run_command("git", &["-C", repo, "fetch", "origin", "main"]);
-                let _ = self
-                    .runner
-                    .run_command("git", &["-C", repo, "reset", "--hard", "origin/main"]);
-            }
-            let dist_src = repo_path.join("dist");
-            if dist_src.is_dir() {
-                let dist_dest = slot_dir.join("dist");
-                fs::create_dir_all(&dist_dest)?;
-                let src_dot = format!("{}/.", dist_src.display());
-                let _ = self
-                    .runner
-                    .run_command("cp", &["-a", &src_dot, dist_dest.to_str().unwrap_or("")]);
-                return Ok(());
-            }
-        }
-        Ok(())
+        let paths: Vec<&Path> = repo_candidates.iter().map(Path::new).collect();
+        self.stage_static_web_bundle_from_git_repos(slot_dir, git_commit, &paths)
     }
 
-    /// Ensures that `candidate_path` (`/srv/muconde/staging/<artifact_sha256>`) exists before staging.
+    /// Checkout-and-stage helper operating on explicit repository candidate paths for deterministic
+    /// commit-pinned deployments and tests.
+    pub fn stage_static_web_bundle_from_git_repos(
+        &self,
+        slot_dir: &Path,
+        git_commit: &str,
+        repo_candidates: &[&Path],
+    ) -> Result<(), AgentError> {
+        let pinned_commit = validate_git_commit_sha(git_commit)?;
+
+        for repo_path in repo_candidates {
+            if !repo_path.join(".git").exists() {
+                continue;
+            }
+            let repo_str = repo_path.to_str().ok_or_else(|| {
+                AgentError::BundleVerification(format!(
+                    "Non-UTF-8 repository path: '{}'",
+                    repo_path.display()
+                ))
+            })?;
+
+            let commit_obj = format!("{pinned_commit}^{{commit}}");
+            if self
+                .runner
+                .run_command("git", &["-C", repo_str, "cat-file", "-e", &commit_obj])
+                .is_err()
+            {
+                self.runner.run_command(
+                    "git",
+                    &[
+                        "-C",
+                        repo_str,
+                        "fetch",
+                        "--depth=1",
+                        "origin",
+                        &pinned_commit,
+                    ],
+                )?;
+                self.runner
+                    .run_command("git", &["-C", repo_str, "cat-file", "-e", &commit_obj])?;
+            }
+
+            self.runner.run_command(
+                "git",
+                &[
+                    "-C",
+                    repo_str,
+                    "checkout",
+                    "--detach",
+                    "--force",
+                    &pinned_commit,
+                ],
+            )?;
+            let head_out = self
+                .runner
+                .run_command("git", &["-C", repo_str, "rev-parse", "HEAD"])?;
+            let actual_head = head_out.stdout.trim().to_ascii_lowercase();
+            if actual_head != pinned_commit {
+                return Err(AgentError::BundleVerification(format!(
+                    "Static web checkout HEAD mismatch in '{}': expected {pinned_commit}, got '{actual_head}'",
+                    repo_path.display()
+                )));
+            }
+
+            let dist_src = repo_path.join("dist");
+            if !dist_src.is_dir() {
+                return Err(AgentError::BundleVerification(format!(
+                    "Checked out pinned commit {pinned_commit} in '{}', but '{}' is missing",
+                    repo_path.display(),
+                    dist_src.display()
+                )));
+            }
+
+            let staging_dist = slot_dir.join(format!(
+                "{STATIC_WEB_ARCHIVE_STAGING_DIR}-{}",
+                Uuid::new_v4()
+            ));
+            copy_dir_contents(&dist_src, &staging_dist)?;
+            let final_dist = slot_dir.join("dist");
+            if final_dist.exists() {
+                fs::remove_dir_all(&final_dist)?;
+            }
+            fs::rename(&staging_dist, &final_dist)?;
+            return Ok(());
+        }
+
+        Err(AgentError::BundleVerification(format!(
+            "No static web repository checkout found for pinned commit {pinned_commit}"
+        )))
+    }
+
+    /// Ensures `candidate_path` (`/srv/muconde/staging/<artifact_sha256>`) exists and strictly
+    /// matches `artifact_sha256`.
     ///
-    /// If not already present on disk, resolves the artifact from:
-    /// 1. Local `MuRegist` CAS blob store (`/var/lib/muregist/blobs/<sha256>`),
-    /// 2. Shared CI release target directory (`/var/lib/action-runner/workspace/target_shared/release/<bin>`),
-    /// 3. Installed host binary (`/usr/local/bin/<bin>`), or
-    /// 4. Static web bundle stamp when `is_static_web_service(service)` is true.
-    pub fn ensure_candidate_artifact(
+    /// Fails closed on any invalid SHA-256 digest, on-disk checksum mismatch, or missing verified
+    /// CAS / `mu-registry` artifact. Never synthesizes shell stubs or copies unverified host
+    /// binaries.
+    pub async fn ensure_candidate_artifact(
         &self,
         service: &str,
         artifact_sha256: &str,
         candidate_path: &Path,
     ) -> Result<(), AgentError> {
-        if candidate_path.exists() {
-            return Ok(());
-        }
         validate_service_name(service)?;
-        if let Some(parent) = candidate_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let digest = validate_sha256_digest(artifact_sha256)?;
 
-        // 1. Check MuRegist CAS blob
-        let cas_blob = Path::new("/var/lib/muregist/blobs").join(artifact_sha256);
-        if cas_blob.is_file() {
-            fs::copy(&cas_blob, candidate_path)?;
-            let mut perms = fs::metadata(candidate_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(candidate_path, perms)?;
-            return Ok(());
-        }
-
-        // 2. Check static web service
-        if is_static_web_service(service) {
-            let stamp =
-                format!("#!/bin/sh\n# static web bundle {service} {artifact_sha256}\nexit 0\n");
-            fs::write(candidate_path, stamp.as_bytes())?;
-            let mut perms = fs::metadata(candidate_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(candidate_path, perms)?;
-            return Ok(());
-        }
-
-        // 3. Check built release binary or installed /usr/local/bin binary
-        for bin in candidate_binary_names(service) {
-            let candidates = [
-                PathBuf::from(format!(
-                    "/var/lib/action-runner/workspace/target_shared/release/{bin}"
-                )),
-                PathBuf::from(format!("/usr/local/bin/{bin}")),
-            ];
-            for src in candidates {
-                if src.is_file() {
-                    fs::copy(&src, candidate_path)?;
-                    let mut perms = fs::metadata(candidate_path)?.permissions();
-                    perms.set_mode(0o755);
-                    fs::set_permissions(candidate_path, perms)?;
-                    return Ok(());
-                }
+        if let Ok(meta) = fs::symlink_metadata(candidate_path) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(AgentError::BundleVerification(format!(
+                    "Candidate path '{}' is not a regular file",
+                    candidate_path.display()
+                )));
             }
+            let existing = fs::read(candidate_path)?;
+            if let Err(err) = verify_sha256_bytes(&existing, &digest) {
+                let _ = fs::remove_file(candidate_path);
+                return Err(err);
+            }
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o777 != 0o755 {
+                perms.set_mode(0o755);
+                fs::set_permissions(candidate_path, perms)?;
+            }
+            return Ok(());
         }
 
+        let Some(fetcher) = self.effective_artifact_fetcher() else {
+            return Err(AgentError::BundleVerification(format!(
+                "Candidate artifact {digest} for '{service}' is absent at '{}' and no verified CAS or mu-registry source is configured",
+                candidate_path.display()
+            )));
+        };
+
+        let bytes = fetcher.fetch_candidate_artifact(&digest).await?;
+        write_file_atomic(candidate_path, &bytes, 0o755)?;
         Ok(())
     }
 
@@ -976,6 +1340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_btrfs_command_construction_and_staging() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -1041,6 +1406,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_handle_stage_deployment_request() {
         let temp = tempdir().unwrap();
         let root = temp.path();
@@ -1171,6 +1537,262 @@ mod tests {
         assert_eq!(
             fs::read(btrfs.slot_dir(service, "@a").join("bin").join(service)).unwrap(),
             b"v3-binary"
+        );
+    }
+
+    #[test]
+    fn test_canonical_binary_and_systemd_unit_priority_order() {
+        assert_eq!(
+            candidate_binary_names("action-runner-controller")[0],
+            "mu-ci-controller"
+        );
+        assert_eq!(
+            candidate_binary_names("mu-ci-controller"),
+            &["mu-ci-controller", "action-runner-controller"]
+        );
+        assert_eq!(candidate_binary_names("muregist")[0], "mu-registry");
+        assert_eq!(candidate_binary_names("muobserve")[0], "mu-observable-hub");
+        assert_eq!(
+            candidate_binary_names("muobservectl")[0],
+            "mu-observable-hub"
+        );
+        assert_eq!(
+            candidate_binary_names("muobserve-collector"),
+            &[
+                "mu-observable-collector",
+                "muobserve-collector",
+                "muobserve-sentinel",
+            ]
+        );
+        assert_eq!(
+            candidate_binary_names("muobserve-sentinel"),
+            &["mu-observable-sentinel", "muobserve-sentinel"]
+        );
+        assert_eq!(
+            candidate_binary_names("muconde-agent"),
+            &["mu-cd-agent", "muconde-agent"]
+        );
+        assert_eq!(
+            candidate_binary_names("muconde-controller"),
+            &["mu-cd-controller", "muconde-controller"]
+        );
+        assert_eq!(candidate_binary_names("action-runner")[0], "mu-ci-worker");
+
+        assert_eq!(
+            candidate_systemd_units("mu-console"),
+            vec!["nginx.service".to_string()]
+        );
+        assert_eq!(
+            candidate_systemd_units("muobserve"),
+            vec![
+                "mu-observable-hub.service".to_string(),
+                "muobserve.service".to_string(),
+                "muobservectl.service".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_ensure_candidate_artifact_verifies_cas_and_fails_closed() {
+        use sha2::{Digest, Sha256};
+
+        let temp = tempdir().unwrap();
+        let cas_dir = temp.path().join("cas");
+        let root = temp.path().join("muconde");
+        let payload = b"#!/bin/sh\necho verified-binary\n";
+        let digest = hex::encode(Sha256::digest(payload));
+
+        let blob_path = cas_dir.join("blobs").join("sha256").join(&digest[..2]);
+        fs::create_dir_all(&blob_path).unwrap();
+        fs::write(blob_path.join(&digest), payload).unwrap();
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let btrfs = BtrfsManager::new(&root, runner).with_cas_blobs_dir(Some(cas_dir));
+
+        let candidate_path = root.join("staging").join(&digest);
+        btrfs
+            .ensure_candidate_artifact("mu-cd-agent", &digest, &candidate_path)
+            .await
+            .expect("CAS blob should stage and verify");
+        assert_eq!(fs::read(&candidate_path).unwrap(), payload);
+        assert_eq!(
+            fs::metadata(&candidate_path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // Tampered on-disk candidate must fail closed and be removed
+        let bad_candidate = root.join("staging").join("tampered");
+        fs::write(&bad_candidate, b"corrupted").unwrap();
+        let err = btrfs
+            .ensure_candidate_artifact("mu-cd-agent", &digest, &bad_candidate)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::BundleVerification(_)));
+        assert!(!bad_candidate.exists());
+
+        // Non-hex digest or missing CAS/registry must fail closed
+        let err_invalid = btrfs
+            .ensure_candidate_artifact("mu-cd-agent", "not-a-sha256", &candidate_path)
+            .await
+            .unwrap_err();
+        assert!(matches!(err_invalid, AgentError::BundleVerification(_)));
+
+        let missing_digest = "a".repeat(64);
+        let err_missing = btrfs
+            .ensure_candidate_artifact(
+                "mu-cd-agent",
+                &missing_digest,
+                &root.join("staging").join(&missing_digest),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err_missing, AgentError::BundleVerification(_)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_static_web_archive_staging_and_mismatch_fail_closed() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let (archive_bytes, archive_digest) = crate::sandbox_it::tests::build_test_tar_gz(&[
+            ("dist/index.html", b"<html>v1</html>", 0o644),
+            ("dist/assets/app.js", b"console.log('ok');", 0o644),
+        ]);
+
+        let cand_archive = temp.path().join("mu-console.tar.gz");
+        fs::write(&cand_archive, &archive_bytes).unwrap();
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let btrfs = BtrfsManager::new(&root, runner);
+
+        let prep = btrfs
+            .prepare_staging_slot_with_rules(
+                "mu-console",
+                &cand_archive,
+                &archive_digest,
+                "initial",
+                Some(Slot::B),
+                &AbRulesConfig::default(),
+            )
+            .expect("valid verified static web tarball stages cleanly");
+        assert_eq!(prep.staged_slot, Slot::B);
+        let staged_dist = btrfs.slot_dir("mu-console", "@b").join("dist");
+        assert_eq!(
+            fs::read_to_string(staged_dist.join("index.html")).unwrap(),
+            "<html>v1</html>"
+        );
+        assert_eq!(
+            fs::read_to_string(staged_dist.join("assets/app.js")).unwrap(),
+            "console.log('ok');"
+        );
+
+        // Non-archive bogus shell script fails closed
+        let bogus_stamp = temp.path().join("bogus-stamp.sh");
+        fs::write(&bogus_stamp, b"#!/bin/sh\nexit 0\n").unwrap();
+        let err = btrfs
+            .prepare_staging_slot_with_rules(
+                "mu-console",
+                &bogus_stamp,
+                &archive_digest,
+                "initial",
+                Some(Slot::A),
+                &AbRulesConfig::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, AgentError::BundleVerification(_)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_stage_static_web_bundle_pins_exact_git_commit_and_rejects_floating_refs() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("mu-console");
+        let slot_dir = temp.path().join("slot-b");
+        fs::create_dir_all(repo.join("dist")).unwrap();
+        fs::create_dir_all(&slot_dir).unwrap();
+
+        let runner = Arc::new(SystemCommandRunner::new());
+        let btrfs = BtrfsManager::new(temp.path().join("muconde"), runner.clone());
+
+        runner
+            .run_command("git", &["init", repo.to_str().unwrap()])
+            .unwrap();
+
+        let make_commit = |parent: Option<&str>, content: &str| -> String {
+            fs::write(repo.join("dist/version.txt"), content).unwrap();
+            runner
+                .run_command(
+                    "git",
+                    &["-C", repo.to_str().unwrap(), "add", "dist/version.txt"],
+                )
+                .unwrap();
+            let tree = runner
+                .run_command("git", &["-C", repo.to_str().unwrap(), "write-tree"])
+                .unwrap()
+                .stdout
+                .trim()
+                .to_string();
+            let mut commit_args = vec![
+                "-C",
+                repo.to_str().unwrap(),
+                "-c",
+                "user.email=ci@example.com",
+                "-c",
+                "user.name=CI",
+                "commit-tree",
+                &tree,
+                "-m",
+                content,
+            ];
+            if let Some(p) = parent {
+                commit_args.push("-p");
+                commit_args.push(p);
+            }
+            let sha = runner
+                .run_command("git", &commit_args)
+                .unwrap()
+                .stdout
+                .trim()
+                .to_string();
+            runner
+                .run_command(
+                    "git",
+                    &["-C", repo.to_str().unwrap(), "update-ref", "HEAD", &sha],
+                )
+                .unwrap();
+            sha
+        };
+
+        let c1 = make_commit(None, "v1-pinned");
+        let _c2 = make_commit(Some(&c1), "v2-floating");
+        runner
+            .run_command(
+                "git",
+                &[
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "checkout",
+                    "--detach",
+                    "--force",
+                    &_c2,
+                ],
+            )
+            .unwrap();
+
+        // Floating branch ref must fail closed
+        let branch_err = btrfs
+            .stage_static_web_bundle_from_git_repos(&slot_dir, "main", &[repo.as_path()])
+            .unwrap_err();
+        assert!(matches!(branch_err, AgentError::BundleVerification(_)));
+
+        // Pinned commit 1 restores exact v1 assets instead of floating v2
+        btrfs
+            .stage_static_web_bundle_from_git_repos(&slot_dir, &c1, &[repo.as_path()])
+            .expect("pinned commit should checkout and copy dist");
+        assert_eq!(
+            fs::read_to_string(slot_dir.join("dist/version.txt")).unwrap(),
+            "v1-pinned"
         );
     }
 }
