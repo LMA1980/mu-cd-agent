@@ -809,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_handle_rollback_command_direct() {
         let service = "muconde-agent";
         let (_temp, slot_mgr, _runner) = setup_env(service);

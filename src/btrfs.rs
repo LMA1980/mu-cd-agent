@@ -1340,6 +1340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_btrfs_command_construction_and_staging() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -1405,6 +1406,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_handle_stage_deployment_request() {
         let temp = tempdir().unwrap();
         let root = temp.path();

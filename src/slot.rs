@@ -554,6 +554,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_atomic_swap_active_slot() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("muconde");
@@ -615,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_path_traversal_rejection_in_swap() {
         let temp = tempdir().unwrap();
         let runner = Arc::new(MockCommandRunner::new(false));

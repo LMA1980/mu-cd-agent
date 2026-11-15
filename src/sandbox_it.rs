@@ -1067,7 +1067,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_log_excerpt_redaction_and_bounding() {
-        let raw = "line1 token=super-secret-value Bearer secret-abc\n".repeat(400);
+        #[cfg(miri)]
+        const REPEATS: usize = 25;
+        #[cfg(not(miri))]
+        const REPEATS: usize = 400;
+        let raw = "line1 token=super-secret-value Bearer secret-abc\n".repeat(REPEATS);
         let scrubbed = sanitize_and_bound_log_excerpt(&raw, 512);
         assert!(scrubbed.len() <= 512);
         assert!(!scrubbed.contains("super-secret-value"));
