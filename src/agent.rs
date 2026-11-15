@@ -257,13 +257,14 @@ pub struct MuConDeAgent {
     it_fetcher: Arc<dyn ItArchiveFetcher>,
     it_executor: Arc<dyn SandboxedCommandExecutor>,
     staged_digests: Arc<Mutex<HashMap<String, String>>>,
+    swap_units: Arc<Mutex<HashMap<String, String>>>,
 }
 
 struct ServiceContract {
     selection: IntegrationTestSelection,
     it_archive_digest: Option<String>,
     ab_rules: AbRulesConfig,
-    deployment: DeploymentConfig,
+    deployment: Option<DeploymentConfig>,
 }
 
 fn validate_staging_artifact_token(raw: &str) -> Result<&str, AgentError> {
@@ -322,6 +323,7 @@ impl MuConDeAgent {
             it_fetcher,
             it_executor,
             staged_digests: Arc::new(Mutex::new(HashMap::new())),
+            swap_units: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -368,7 +370,7 @@ impl MuConDeAgent {
                     selection,
                     it_archive_digest: digest,
                     ab_rules: manifest.ab_rules,
-                    deployment: manifest.deployment,
+                    deployment: Some(manifest.deployment),
                 });
             }
         }
@@ -377,7 +379,7 @@ impl MuConDeAgent {
             selection: self.config.integration_tests.clone(),
             it_archive_digest: self.config.it_archive_digest.clone(),
             ab_rules: self.config.ab_rules.clone(),
-            deployment: DeploymentConfig::default(),
+            deployment: None,
         })
     }
 
@@ -391,6 +393,7 @@ impl MuConDeAgent {
             it_fetcher: self.it_fetcher.clone(),
             it_executor: self.it_executor.clone(),
             staged_digests: self.staged_digests.clone(),
+            swap_units: self.swap_units.clone(),
         }
     }
 
@@ -652,8 +655,25 @@ impl MuConDeAgent {
                     let rb_start_ns = now_unix_nano();
                     let rb_trace_ctx = trace_context_for_deployment(&cmd.deployment_id, 3);
 
-                    let (report, taint, elapsed_ms) =
-                        self.watchdog_monitor.handle_rollback_command(&cmd)?;
+                    let restore_slot = Slot::from(cmd.restore_slot);
+                    let rb_deployment = self
+                        .resolve_service_contract(&cmd.service_name, Some(restore_slot))
+                        .ok()
+                        .and_then(|c| c.deployment);
+                    let prior_cmd_unit = self
+                        .swap_units
+                        .lock()
+                        .await
+                        .get(&cmd.deployment_id)
+                        .cloned();
+
+                    let (report, taint, elapsed_ms) = self
+                        .watchdog_monitor
+                        .handle_rollback_command_with_deployment(
+                            &cmd,
+                            rb_deployment.as_ref(),
+                            prior_cmd_unit.as_deref(),
+                        )?;
 
                     let rb_end_ns = now_unix_nano().max(rb_start_ns);
                     let rb_dur_ns = (rb_end_ns - rb_start_ns) as u64;
@@ -871,10 +891,20 @@ impl MuConDeAgent {
             .unwrap_or_else(|| "candidate-sha".to_string());
 
         let contract = self.resolve_service_contract(&cmd.service_name, Some(target_slot))?;
+        let rollback_deployment = self
+            .resolve_service_contract(&cmd.service_name, Some(restore_slot))
+            .ok()
+            .and_then(|c| c.deployment)
+            .or_else(|| contract.deployment.clone());
+        self.swap_units
+            .lock()
+            .await
+            .insert(cmd.deployment_id.clone(), cmd.systemd_unit.clone());
+
         let _receipt = self.slot_manager.atomic_swap_active_slot_with_deployment(
             &cmd.service_name,
             target_slot,
-            Some(&contract.deployment),
+            contract.deployment.as_ref(),
             Some(&cmd.systemd_unit),
         )?;
 
@@ -949,6 +979,7 @@ impl MuConDeAgent {
                             &swap_trace_ctx,
                             swap_end_ns,
                             gate_err,
+                            rollback_deployment.as_ref(),
                         )
                         .await;
                 }
@@ -977,16 +1008,18 @@ impl MuConDeAgent {
         let cand_sha_clone = candidate_sha256.clone();
         let consecutive_req = self.config.required_consecutive_successes;
         let expires_at_ms = now_epoch_ms() + (cmd.warmup_timeout_secs * 1000);
+        let warmup_rollback_deployment = rollback_deployment.clone();
 
         let outcome_task = tokio::spawn(async move {
             monitor
-                .monitor_warmup(
+                .monitor_warmup_with_deployment(
                     &cmd_clone,
                     &cand_sha_clone,
                     expires_at_ms,
                     consecutive_req,
                     Some(tx),
                     None,
+                    warmup_rollback_deployment,
                 )
                 .await
         });
@@ -1111,6 +1144,7 @@ impl MuConDeAgent {
                         &mut gate,
                         &custom_tests,
                         &ab_rules,
+                        rollback_deployment.as_ref(),
                     )
                     .await?;
                 }
@@ -1142,6 +1176,7 @@ impl MuConDeAgent {
         swap_trace_ctx: &mu_observable_ipc::TraceContext,
         swap_end_ns: i64,
         gate_err: AgentError,
+        rollback_deployment: Option<&DeploymentConfig>,
     ) -> Result<(), AgentError> {
         let reason = gate_err.to_string();
         let failed_tests = match &gate_err {
@@ -1158,13 +1193,16 @@ impl MuConDeAgent {
         let finished = tracker.finish_remaining(|_| false);
         send_it_progress(stream, fory, &finished, sequence).await;
 
-        let (mut report, taint, elapsed_rollback_ms) = self.watchdog_monitor.execute_rollback(
-            &cmd.deployment_id,
-            &cmd.service_name,
-            restore_slot,
-            candidate_sha256,
-            &reason,
-        )?;
+        let (mut report, taint, elapsed_rollback_ms) =
+            self.watchdog_monitor.execute_rollback_with_deployment(
+                &cmd.deployment_id,
+                &cmd.service_name,
+                restore_slot,
+                candidate_sha256,
+                &reason,
+                rollback_deployment,
+                Some(cmd.systemd_unit.as_str()),
+            )?;
         self.emit_rollback_span(
             cmd,
             restore_slot,
@@ -1201,6 +1239,7 @@ impl MuConDeAgent {
         gate: &mut GateTracker,
         custom_tests: &[DiscoveredItTest],
         ab_rules: &AbRulesConfig,
+        rollback_deployment: Option<&DeploymentConfig>,
     ) -> Result<(), AgentError> {
         let suite_start = Instant::now();
         let mut aggregated_logs = String::new();
@@ -1245,12 +1284,14 @@ impl MuConDeAgent {
 
                 let reason = format!("Critical sandboxed integration test '{}' failed", test.name);
                 let (mut report, taint, elapsed_rollback_ms) =
-                    self.watchdog_monitor.execute_rollback(
+                    self.watchdog_monitor.execute_rollback_with_deployment(
                         &cmd.deployment_id,
                         &cmd.service_name,
                         restore_slot,
                         candidate_sha256,
                         &reason,
+                        rollback_deployment,
+                        Some(cmd.systemd_unit.as_str()),
                     )?;
                 self.emit_rollback_span(
                     cmd,
@@ -2509,6 +2550,163 @@ mod tests {
         // 4. Verified CAS blob stages successfully
         let r4 = send_stage(&mut client, &fory, valid_sha, 4).await;
         assert!(r4.staged_ok);
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_rollback_paths_preserve_deployment_config_and_unit_overrides() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let service = "muregist";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a/.mucd")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+        fs::write(
+            srv_dir.join("@a/.mucd/mu-cd.yml"),
+            "deployment:\n  systemd_unit: custom-registry-restore.service\n",
+        )
+        .unwrap();
+
+        // Also seed a static web service to confirm MSG_TYPE_ROLLBACK suppresses systemctl restart
+        let web_dir = root.join("mu-console");
+        fs::create_dir_all(web_dir.join("@a/dist")).unwrap();
+        fs::create_dir_all(web_dir.join("@b/dist")).unwrap();
+        std::os::unix::fs::symlink("@b", web_dir.join("current")).unwrap();
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let prober = Arc::new(MockHealthProber::new(false));
+        let agent = Arc::new(MuConDeAgent::new(
+            MuConDeAgentConfig {
+                node_id: "node-rb-override".into(),
+                muconde_root: root,
+                default_warmup_timeout_secs: 5,
+                required_consecutive_successes: 2,
+                ..Default::default()
+            },
+            runner.clone(),
+            prober,
+        ));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+        let fory = create_fory_runtime().unwrap();
+
+        // 1. Warmup failure triggers monitor_warmup_with_deployment -> rollback restarts manifest override unit
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-rb-override".into(),
+            lease_id: "lease-rb".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "legacy-fallback.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 1),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        let _frames = read_frames_until(&mut client, 5, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+
+        let restart_calls: Vec<Vec<String>> = runner
+            .recorded_calls()
+            .into_iter()
+            .filter(|c| c.len() >= 3 && c[0] == "systemctl" && c[1] == "restart")
+            .collect();
+        // Forward swap (@b has no override) uses command/alias unit; rollback to @a honors @a manifest systemd_unit
+        assert_eq!(
+            restart_calls.last().unwrap(),
+            &vec![
+                "systemctl".to_string(),
+                "restart".to_string(),
+                "custom-registry-restore.service".to_string()
+            ]
+        );
+
+        // 2. Explicit MSG_TYPE_ROLLBACK respects prior SlotSwapCommand.systemd_unit when no manifest exists
+        let calls_before_explicit = runner.recorded_calls().len();
+        let rb_cmd = RollbackCommand {
+            deployment_id: "dep-rb-override".into(),
+            lease_id: "lease-rb".into(),
+            service_name: "mu-ci-worker".into(),
+            restore_slot: DeploymentSlot::SlotA,
+            failed_artifact_sha256: "deadbeef".into(),
+            reason: "explicit rollback override test".into(),
+        };
+        fs::create_dir_all(agent.config.muconde_root.join("mu-ci-worker/@a")).unwrap();
+        let rb_bytes = fory.serialize(&rb_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_ROLLBACK, rb_bytes.len() as u32, 0, 2),
+            &rb_bytes,
+        )
+        .await
+        .unwrap();
+        let _rb_frames = read_frames_until(&mut client, 2, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+        let explicit_restarts: Vec<Vec<String>> = runner
+            .recorded_calls()
+            .into_iter()
+            .skip(calls_before_explicit)
+            .filter(|c| c.len() >= 3 && c[0] == "systemctl" && c[1] == "restart")
+            .collect();
+        assert_eq!(
+            explicit_restarts,
+            vec![vec![
+                "systemctl".to_string(),
+                "restart".to_string(),
+                "legacy-fallback.service".to_string()
+            ]]
+        );
+
+        // 3. Explicit MSG_TYPE_ROLLBACK on static web suppresses systemctl restart
+        let calls_before_web = runner.recorded_calls().len();
+        let web_rb = RollbackCommand {
+            deployment_id: "dep-web-rb".into(),
+            lease_id: "lease-web".into(),
+            service_name: "mu-console".into(),
+            restore_slot: DeploymentSlot::SlotA,
+            failed_artifact_sha256: "feedface".into(),
+            reason: "static web rollback".into(),
+        };
+        let web_bytes = fory.serialize(&web_rb).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_ROLLBACK, web_bytes.len() as u32, 0, 3),
+            &web_bytes,
+        )
+        .await
+        .unwrap();
+        let _web_frames = read_frames_until(&mut client, 2, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+        let web_restarts: Vec<Vec<String>> = runner
+            .recorded_calls()
+            .into_iter()
+            .skip(calls_before_web)
+            .filter(|c| c.len() >= 3 && c[0] == "systemctl" && c[1] == "restart")
+            .collect();
+        assert!(
+            web_restarts.is_empty(),
+            "Static web rollback must suppress systemctl restart"
+        );
 
         drop(client);
         let _ = agent_task.await;

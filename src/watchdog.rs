@@ -330,14 +330,40 @@ impl WatchdogMonitor {
         candidate_artifact_sha256: &str,
         reason: &str,
     ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
+        self.execute_rollback_with_deployment(
+            deployment_id,
+            service,
+            restore_slot,
+            candidate_artifact_sha256,
+            reason,
+            self.deployment.as_ref(),
+            self.cmd_systemd_unit.as_deref(),
+        )
+    }
+
+    /// Autonomous sub-second (< 1s) rollback engine with explicit [`DeploymentConfig`] and
+    /// `systemd_unit` overrides.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_rollback_with_deployment(
+        &self,
+        deployment_id: &str,
+        service: &str,
+        restore_slot: Slot,
+        candidate_artifact_sha256: &str,
+        reason: &str,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
         let start = Instant::now();
+        let effective_deployment = deployment.or(self.deployment.as_ref());
+        let effective_unit = cmd_systemd_unit.or(self.cmd_systemd_unit.as_deref());
 
         // 1. Immediately revert active slot to `restore_slot` (restoring prior read-only snapshot if needed)
         self.slot_manager.rollback_to_prior_slot_with_deployment(
             service,
             Some(restore_slot),
-            self.deployment.as_ref(),
-            self.cmd_systemd_unit.as_deref(),
+            effective_deployment,
+            effective_unit,
         )?;
 
         let elapsed_rollback_ms = start.elapsed().as_millis() as u64;
@@ -388,22 +414,53 @@ impl WatchdogMonitor {
         &self,
         cmd: &RollbackCommand,
     ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
-        self.execute_rollback(
+        self.handle_rollback_command_with_deployment(cmd, None, None)
+    }
+
+    /// Handles an explicit `RollbackCommand` while applying explicit [`DeploymentConfig`] and
+    /// `systemd_unit` overrides.
+    pub fn handle_rollback_command_with_deployment(
+        &self,
+        cmd: &RollbackCommand,
+        deployment: Option<&DeploymentConfig>,
+        cmd_systemd_unit: Option<&str>,
+    ) -> Result<(IntegrationTestReport, ArtifactTaintNotification, u64), AgentError> {
+        self.execute_rollback_with_deployment(
             &cmd.deployment_id,
             &cmd.service_name,
             Slot::from(cmd.restore_slot),
             &cmd.failed_artifact_sha256,
             &cmd.reason,
+            deployment,
+            cmd_systemd_unit,
         )
     }
 
-    /// Runs a bounded post-swap warmup watchdog monitor:
-    /// - Checks health at 250ms intervals.
-    /// - Emits `HealthProbeTelemetry` per probe tick over `telemetry_tx`.
-    /// - Autonomously executes instant rollback to `command.from_slot` (< 1s) upon:
-    ///   - Any unhealthy probe or process exit/crash.
-    ///   - Deployment lease TTL expiration without controller promotion.
-    ///   - External rollback signal via `rollback_rx`.
+    fn rolled_back_outcome(
+        &self,
+        command: &SlotSwapCommand,
+        restore_slot: Slot,
+        candidate_artifact_sha256: &str,
+        reason: &str,
+        deployment: Option<&DeploymentConfig>,
+    ) -> Result<WatchdogOutcome, AgentError> {
+        let (report, taint, elapsed_rollback_ms) = self.execute_rollback_with_deployment(
+            &command.deployment_id,
+            &command.service_name,
+            restore_slot,
+            candidate_artifact_sha256,
+            reason,
+            deployment,
+            Some(command.systemd_unit.as_str()),
+        )?;
+        Ok(WatchdogOutcome::RolledBack {
+            report: Box::new(report),
+            taint: Box::new(taint),
+            elapsed_rollback_ms,
+        })
+    }
+
+    /// Runs a bounded post-swap warmup watchdog monitor using default configured deployment overrides.
     pub async fn monitor_warmup(
         &self,
         command: &SlotSwapCommand,
@@ -411,7 +468,38 @@ impl WatchdogMonitor {
         expires_at_epoch_ms: u64,
         required_consecutive_successes: u32,
         telemetry_tx: Option<mpsc::Sender<HealthProbeTelemetry>>,
+        rollback_rx: Option<mpsc::Receiver<String>>,
+    ) -> Result<WatchdogOutcome, AgentError> {
+        self.monitor_warmup_with_deployment(
+            command,
+            candidate_artifact_sha256,
+            expires_at_epoch_ms,
+            required_consecutive_successes,
+            telemetry_tx,
+            rollback_rx,
+            None,
+        )
+        .await
+    }
+
+    /// Runs a bounded post-swap warmup watchdog monitor while applying explicit [`DeploymentConfig`]
+    /// and `command.systemd_unit` overrides to any triggered rollback:
+    /// - Checks health at 250ms intervals.
+    /// - Emits `HealthProbeTelemetry` per probe tick over `telemetry_tx`.
+    /// - Autonomously executes instant rollback to `command.from_slot` (< 1s) upon:
+    ///   - Any unhealthy probe or process exit/crash.
+    ///   - Deployment lease TTL expiration without controller promotion.
+    ///   - External rollback signal via `rollback_rx`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn monitor_warmup_with_deployment(
+        &self,
+        command: &SlotSwapCommand,
+        candidate_artifact_sha256: &str,
+        expires_at_epoch_ms: u64,
+        required_consecutive_successes: u32,
+        telemetry_tx: Option<mpsc::Sender<HealthProbeTelemetry>>,
         mut rollback_rx: Option<mpsc::Receiver<String>>,
+        deployment: Option<DeploymentConfig>,
     ) -> Result<WatchdogOutcome, AgentError> {
         let warmup_duration = Duration::from_secs(command.warmup_timeout_secs);
         let deadline = Instant::now() + warmup_duration;
@@ -430,18 +518,13 @@ impl WatchdogMonitor {
                         None => std::future::pending().await,
                     }
                 } => {
-                    let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                        &command.deployment_id,
-                        &command.service_name,
+                    return self.rolled_back_outcome(
+                        command,
                         restore_slot,
                         candidate_artifact_sha256,
                         &format!("External rollback requested: {}", reason),
-                    )?;
-                    return Ok(WatchdogOutcome::RolledBack {
-                        report: Box::new(report),
-                        taint: Box::new(taint),
-                        elapsed_rollback_ms,
-                    });
+                        deployment.as_ref(),
+                    );
                 }
 
                 _ = ticker.tick() => {
@@ -454,18 +537,13 @@ impl WatchdogMonitor {
                             "Deployment lease TTL expired at {} ms (now: {} ms) without promotion",
                             expires_at_epoch_ms, current_time_ms
                         );
-                        let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                            &command.deployment_id,
-                            &command.service_name,
+                        return self.rolled_back_outcome(
+                            command,
                             restore_slot,
                             candidate_artifact_sha256,
                             &reason,
-                        )?;
-                        return Ok(WatchdogOutcome::RolledBack {
-                            report: Box::new(report),
-                            taint: Box::new(taint),
-                            elapsed_rollback_ms,
-                        });
+                            deployment.as_ref(),
+                        );
                     }
 
                     // 2. Execute health probe
@@ -497,19 +575,13 @@ impl WatchdogMonitor {
                             probe_res.systemd_active, probe_res.health_endpoint_ok, detail
                         );
 
-                        let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                            &command.deployment_id,
-                            &command.service_name,
+                        return self.rolled_back_outcome(
+                            command,
                             restore_slot,
                             candidate_artifact_sha256,
                             &reason,
-                        )?;
-
-                        return Ok(WatchdogOutcome::RolledBack {
-                            report: Box::new(report),
-                            taint: Box::new(taint),
-                            elapsed_rollback_ms,
-                        });
+                            deployment.as_ref(),
+                        );
                     }
 
                     // Probe was healthy
@@ -535,18 +607,13 @@ impl WatchdogMonitor {
                             "Warmup timeout ({}s) elapsed before achieving {} consecutive healthy probes (got {})",
                             command.warmup_timeout_secs, required_consecutive_successes, consecutive_successes
                         );
-                        let (report, taint, elapsed_rollback_ms) = self.execute_rollback(
-                            &command.deployment_id,
-                            &command.service_name,
+                        return self.rolled_back_outcome(
+                            command,
                             restore_slot,
                             candidate_artifact_sha256,
                             &reason,
-                        )?;
-                        return Ok(WatchdogOutcome::RolledBack {
-                            report: Box::new(report),
-                            taint: Box::new(taint),
-                            elapsed_rollback_ms,
-                        });
+                            deployment.as_ref(),
+                        );
                     }
                 }
             }

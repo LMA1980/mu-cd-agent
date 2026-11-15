@@ -15,7 +15,7 @@ use crate::btrfs::{
     CommandRunner,
 };
 use crate::error::AgentError;
-use crate::manifest::DeploymentConfig;
+use crate::manifest::{DeploymentConfig, MuCdManifest};
 
 /// Deployment slot identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +154,9 @@ impl SlotManager {
     /// Rolls back atomically to `preferred_restore` while honoring declarative [`DeploymentConfig`]
     /// overrides (suppressing `systemctl restart` for static web bundles and resolving canonical
     /// systemd unit aliases for daemons).
+    ///
+    /// When `deployment` is `None`, attempts to load `.mucd/mu-cd.yml` (or legacy
+    /// `.muconde/MuConDe.yml`) from `<svc>/<restore_slot>`, `<svc>`, or the root directory.
     pub fn rollback_to_prior_slot_with_deployment(
         &self,
         service: &str,
@@ -180,10 +183,17 @@ impl SlotManager {
             )?;
         }
 
+        let resolved_manifest = if deployment.is_none() {
+            load_deployment_from_dirs(&[&slot_dir, &srv_dir, &self.root_dir])?
+        } else {
+            None
+        };
+        let effective_deployment = deployment.or(resolved_manifest.as_ref());
+
         self.atomic_swap_active_slot_with_deployment(
             service,
             restore_slot,
-            deployment,
+            effective_deployment,
             cmd_systemd_unit,
         )
     }
@@ -197,12 +207,19 @@ impl SlotManager {
     ) -> Result<SwapReceipt, AgentError> {
         validate_service_name(service)?;
         let srv_dir = self.service_dir(service);
+        let slot_dir = srv_dir.join(restore_slot.as_str());
         crate::btrfs::restore_slot_from_latest_snapshot(
             &srv_dir,
             restore_slot,
             self.runner.as_ref(),
         )?;
-        self.atomic_swap_active_slot(service, restore_slot)
+        let resolved_manifest = load_deployment_from_dirs(&[&slot_dir, &srv_dir, &self.root_dir])?;
+        self.atomic_swap_active_slot_with_deployment(
+            service,
+            restore_slot,
+            resolved_manifest.as_ref(),
+            None,
+        )
     }
 
     /// Atomically swaps the active slot pointer (`/srv/muconde/<service>/current`):
@@ -374,6 +391,15 @@ impl SlotManager {
             .next()
             .unwrap_or_else(|| format!("{service}.service")))
     }
+}
+
+fn load_deployment_from_dirs(dirs: &[&Path]) -> Result<Option<DeploymentConfig>, AgentError> {
+    for dir in dirs {
+        if let Some(manifest) = MuCdManifest::load_optional_from_dir(dir)? {
+            return Ok(Some(manifest.deployment));
+        }
+    }
+    Ok(None)
 }
 
 fn normalize_unit_name(raw: Option<&str>) -> Option<String> {
@@ -715,5 +741,33 @@ mod tests {
             resolve_web_root("mu-console", Some(&unsafe_dep)),
             Err(AgentError::PathTraversal(_))
         ));
+
+        // Rollback without explicit deployment falls back to manifest in restore slot dir
+        let svc_dir = root.join("mu-cd-controller");
+        fs::create_dir_all(svc_dir.join("@a/.mucd")).unwrap();
+        fs::create_dir_all(svc_dir.join("@b")).unwrap();
+        fs::write(
+            svc_dir.join("@a/.mucd/mu-cd.yml"),
+            "deployment:\n  systemd_unit: custom-controller-restore.service\n",
+        )
+        .unwrap();
+        let rb_runner = Arc::new(MockCommandRunner::new(true));
+        let rb_mgr = SlotManager::new(&root, rb_runner.clone());
+        rb_mgr
+            .rollback_to_prior_slot("mu-cd-controller", Some(Slot::A))
+            .unwrap();
+        let rb_restart = rb_runner
+            .recorded_calls()
+            .into_iter()
+            .find(|c| c.len() >= 3 && c[0] == "systemctl" && c[1] == "restart")
+            .unwrap();
+        assert_eq!(
+            rb_restart,
+            vec![
+                "systemctl".to_string(),
+                "restart".to_string(),
+                "custom-controller-restore.service".to_string()
+            ]
+        );
     }
 }
