@@ -1,0 +1,30 @@
+[Unit]
+Description=MuCD Node Continuous Delivery Agent Daemon
+Documentation=https://github.com/LMA1980/mu-cd-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root to manage Btrfs subvolumes under /srv/mucd, atomic binary
+# installs into /usr/local/bin, static web assets under /var/www, and systemctl
+# unit restarts without sudoers wrappers.
+User=root
+Group=root
+StateDirectory=mu-cd-agent
+WorkingDirectory=/var/lib/mu-cd-agent
+EnvironmentFile=/etc/mu-cd-agent/agent.env
+ExecStart=/usr/local/bin/mu-cd-agent
+Restart=always
+RestartSec=5
+
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/mu-cd-agent -/srv/mucd -/srv/muconde /usr/local/bin -/var/www -/srv/www
+InaccessiblePaths=/etc/shadow
+
+[Install]
+WantedBy=multi-user.target
