@@ -17,6 +17,38 @@ use crate::btrfs::{
 use crate::error::AgentError;
 use crate::manifest::{DeploymentConfig, MuCdManifest};
 
+/// Primary continuous delivery root directory on cluster nodes.
+pub const PRIMARY_CD_ROOT: &str = "/srv/mucd";
+
+/// Legacy continuous delivery root directory retained during migration.
+pub const LEGACY_CD_ROOT: &str = "/srv/muconde";
+
+/// Returns `true` when `path` matches one of the production CD roots (`/srv/mucd` or `/srv/muconde`).
+pub fn is_production_cd_root(path: &Path) -> bool {
+    matches!(path.to_str(), Some(PRIMARY_CD_ROOT | LEGACY_CD_ROOT))
+        || path == Path::new(PRIMARY_CD_ROOT)
+        || path == Path::new(LEGACY_CD_ROOT)
+}
+
+/// Resolves the default production CD root (`/srv/mucd` if present, else `/srv/muconde` if
+/// present, else `/srv/mucd`).
+pub fn default_cd_root() -> PathBuf {
+    default_cd_root_with(|p| p.exists())
+}
+
+/// Pure helper resolving the default CD root against a caller-supplied existence predicate.
+pub fn default_cd_root_with(exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let primary = Path::new(PRIMARY_CD_ROOT);
+    if exists(primary) {
+        return primary.to_path_buf();
+    }
+    let legacy = Path::new(LEGACY_CD_ROOT);
+    if exists(legacy) {
+        return legacy.to_path_buf();
+    }
+    primary.to_path_buf()
+}
+
 /// Deployment slot identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
@@ -222,7 +254,7 @@ impl SlotManager {
         )
     }
 
-    /// Atomically swaps the active slot pointer (`/srv/muconde/<service>/current`):
+    /// Atomically swaps the active slot pointer (`/srv/mucd/<service>/current` or legacy `/srv/muconde/<service>/current`):
     /// 1. Creates a temporary symlink `.current.tmp.<nonce>` pointing to `@a` or `@b`.
     /// 2. Atomically replaces `current` via `std::fs::rename` (POSIX rename(2) atomicity).
     /// 3. Triggers `systemctl restart <service>` and returns a `SwapReceipt`.
@@ -265,8 +297,9 @@ impl SlotManager {
             return Err(AgentError::Io(e));
         }
 
-        // 3. On production root (/srv/muconde), activate static web bundle or binary before restart
-        if self.root_dir == Path::new("/srv/muconde") {
+        // 3. On production root (/srv/mucd or /srv/muconde), activate static web bundle or binary before restart
+        let is_prod = is_production_cd_root(&self.root_dir);
+        if is_prod {
             let slot_dir = srv_dir.join(target_slot.as_str());
             if is_static_web_service(service) {
                 let web_root = resolve_web_root(service, deployment)?;
@@ -300,7 +333,7 @@ impl SlotManager {
 
         // 4. Restart daemon systemd unit (static web services reload nginx only if active, never systemctl restart <service>)
         if is_static_web_service(service) {
-            if self.root_dir == Path::new("/srv/muconde") {
+            if is_prod {
                 if let Ok(out) = self
                     .runner
                     .run_command("systemctl", &["is-active", "--quiet", "nginx.service"])
@@ -311,9 +344,7 @@ impl SlotManager {
                     }
                 }
             }
-        } else if !(self.root_dir == Path::new("/srv/muconde")
-            && matches!(service, "muconde-agent" | "mu-cd-agent"))
-        {
+        } else if !(is_prod && matches!(service, "muconde-agent" | "mu-cd-agent")) {
             let restart_target =
                 self.resolve_systemd_restart_target(service, deployment, cmd_systemd_unit)?;
             self.runner
@@ -370,8 +401,7 @@ impl SlotManager {
             }
         }
 
-        if self.root_dir == Path::new("/srv/muconde") || deployment.is_some() || cmd_unit.is_some()
-        {
+        if is_production_cd_root(&self.root_dir) || deployment.is_some() || cmd_unit.is_some() {
             if let Some(found) = select_installed_systemd_unit(self.runner.as_ref(), &candidates) {
                 return Ok(found);
             }
@@ -383,7 +413,7 @@ impl SlotManager {
         if let Some(u) = cmd_unit {
             return Ok(u);
         }
-        if self.root_dir != Path::new("/srv/muconde") {
+        if !is_production_cd_root(&self.root_dir) {
             return Ok(service.to_string());
         }
         Ok(candidates
@@ -432,6 +462,15 @@ pub fn resolve_web_root(
     service: &str,
     deployment: Option<&DeploymentConfig>,
 ) -> Result<String, AgentError> {
+    resolve_web_root_with(service, deployment, |p| p.exists())
+}
+
+/// Pure helper resolving `web_root` against a caller-supplied path-existence predicate.
+pub(crate) fn resolve_web_root_with(
+    service: &str,
+    deployment: Option<&DeploymentConfig>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<String, AgentError> {
     if let Some(raw) = deployment.and_then(|d| d.normalized_web_root()) {
         if raw.contains("..")
             || raw.contains('\\')
@@ -445,7 +484,22 @@ pub fn resolve_web_root(
     }
 
     let default = match service {
-        "muconsole" | "mu-console" => "/var/www/muconsole",
+        "mu-console" => {
+            if exists(Path::new("/var/www/mu-console")) || !exists(Path::new("/var/www/muconsole"))
+            {
+                "/var/www/mu-console"
+            } else {
+                "/var/www/muconsole"
+            }
+        }
+        "muconsole" => {
+            if exists(Path::new("/var/www/muconsole")) || !exists(Path::new("/var/www/mu-console"))
+            {
+                "/var/www/muconsole"
+            } else {
+                "/var/www/mu-console"
+            }
+        }
         "mu-ci-web" => "/var/www/mu-ci-web",
         "action-runner-web" => "/var/www/action-runner-web",
         other => {
@@ -770,6 +824,47 @@ mod tests {
                 "restart".to_string(),
                 "custom-controller-restore.service".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_production_cd_root_and_dual_web_root_resolution() {
+        assert!(is_production_cd_root(Path::new("/srv/mucd")));
+        assert!(is_production_cd_root(Path::new("/srv/mucd/")));
+        assert!(is_production_cd_root(Path::new("/srv/muconde")));
+        assert!(!is_production_cd_root(Path::new("/tmp/muconde")));
+        assert!(!is_production_cd_root(Path::new("/srv/other")));
+
+        // Default CD root favors /srv/mucd, falling back to /srv/muconde only if only legacy exists.
+        assert_eq!(default_cd_root_with(|_| false), PathBuf::from("/srv/mucd"));
+        assert_eq!(
+            default_cd_root_with(|p| p == Path::new("/srv/muconde")),
+            PathBuf::from("/srv/muconde")
+        );
+        assert_eq!(default_cd_root_with(|_| true), PathBuf::from("/srv/mucd"));
+
+        // Static web root dual-path fallback for mu-console / muconsole
+        assert_eq!(
+            resolve_web_root_with("mu-console", None, |_| false).unwrap(),
+            "/var/www/mu-console"
+        );
+        assert_eq!(
+            resolve_web_root_with("mu-console", None, |p| p == Path::new("/var/www/muconsole"))
+                .unwrap(),
+            "/var/www/muconsole"
+        );
+        assert_eq!(
+            resolve_web_root_with("mu-console", None, |_| true).unwrap(),
+            "/var/www/mu-console"
+        );
+        assert_eq!(
+            resolve_web_root_with("muconsole", None, |_| false).unwrap(),
+            "/var/www/muconsole"
+        );
+        assert_eq!(
+            resolve_web_root_with("muconsole", None, |p| p == Path::new("/var/www/mu-console"))
+                .unwrap(),
+            "/var/www/mu-console"
         );
     }
 }

@@ -943,6 +943,9 @@ impl SandboxedCommandExecutor for KernelSandboxedExecutor {
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("TMPDIR", &sandbox_tmp)
+            .env("MU_CD_IT_SERVICE", service_name)
+            .env("MU_CD_IT_SLOT", slot.as_str())
+            .env("MU_CD_IT_WORKDIR", work_dir)
             .env("MUCONDE_IT_SERVICE", service_name)
             .env("MUCONDE_IT_SLOT", slot.as_str())
             .env("MUCONDE_IT_WORKDIR", work_dir);

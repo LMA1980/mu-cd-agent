@@ -38,7 +38,7 @@ use crate::sandbox_it::{
     KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor,
     MAX_LOG_EXCERPT_BYTES,
 };
-use crate::slot::{Slot, SlotManager};
+use crate::slot::{default_cd_root, is_production_cd_root, Slot, SlotManager};
 use crate::telemetry::{
     now_unix_nano, trace_context_for_deployment, MuObserveCollectorSink, TelemetrySink,
     AGENT_SERVICE_NAME,
@@ -85,13 +85,17 @@ impl Default for MuConDeAgentConfig {
         Self {
             node_id: "worker-node".into(),
             listen_addr: "0.0.0.0:8446".into(),
-            muconde_root: PathBuf::from("/srv/muconde"),
+            muconde_root: default_cd_root(),
             tls_ca_path: None,
             tls_cert_path: None,
             tls_key_path: None,
             default_warmup_timeout_secs: 30,
             required_consecutive_successes: 3,
-            collector_addr: std::env::var("MUOBSERVE_COLLECTOR_ADDR").ok(),
+            collector_addr: crate::first_non_empty_env(&[
+                "MU_OBSERVABLE_COLLECTOR_ADDR",
+                "MU_CD_AGENT_COLLECTOR_ADDR",
+                "MUOBSERVE_COLLECTOR_ADDR",
+            ]),
             integration_tests: IntegrationTestSelection::All,
             gate_catalog: builtin_catalog(),
             ab_rules: AbRulesConfig::default(),
@@ -507,7 +511,7 @@ impl MuConDeAgent {
                             .join("staging")
                             .join(artifact_token);
 
-                        let is_prod = self.config.muconde_root == Path::new("/srv/muconde");
+                        let is_prod = is_production_cd_root(&self.config.muconde_root);
                         let has_artifact_source = self.config.registry_url.is_some()
                             || self.config.cas_blobs_dir.is_some();
                         let is_sha256 = validate_sha256_digest(artifact_token).is_ok();

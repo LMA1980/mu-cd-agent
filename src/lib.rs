@@ -35,7 +35,10 @@ pub use sandbox_it::{
     SandboxedExecutionOutput, UnpackedItBundle, DEFAULT_IT_MEMLOCK_KB,
     MAX_IT_ARCHIVE_UNCOMPRESSED_BYTES, MAX_IT_SANDBOX_PIDS, MAX_LOG_EXCERPT_BYTES,
 };
-pub use slot::{Slot, SlotManager, SwapReceipt};
+pub use slot::{
+    default_cd_root, is_production_cd_root, Slot, SlotManager, SwapReceipt, LEGACY_CD_ROOT,
+    PRIMARY_CD_ROOT,
+};
 pub use telemetry::{
     now_unix_nano, trace_context_for_deployment, MuObserveCollectorSink, RecordingTelemetrySink,
     TelemetrySink, AGENT_SERVICE_NAME, DEFAULT_COLLECTOR_ADDR,
@@ -44,6 +47,27 @@ pub use watchdog::{
     now_epoch_ms, HealthProber, MockHealthProber, ProbeResult, SystemHealthProber, WatchdogMonitor,
     WatchdogOutcome,
 };
+
+/// Returns the first non-empty trimmed value across `keys` using `lookup`.
+pub fn first_non_empty_var(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    keys: &[&str],
+) -> Option<String> {
+    for key in keys {
+        if let Some(val) = lookup(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns the first non-empty trimmed environment variable value across `keys`.
+pub fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    first_non_empty_var(&|key| std::env::var(key).ok(), keys)
+}
 
 /// Returns the compiled crate version.
 pub fn agent_version() -> &'static str {

@@ -18,7 +18,7 @@ use tokio::time::interval;
 use crate::btrfs::{candidate_systemd_units, is_static_web_service, CommandRunner};
 use crate::error::AgentError;
 use crate::manifest::{DeploymentConfig, MuCdManifest};
-use crate::slot::{read_active_slot_at, Slot, SlotManager};
+use crate::slot::{is_production_cd_root, read_active_slot_at, Slot, SlotManager};
 
 /// Current timestamp in milliseconds since Unix epoch.
 pub fn now_epoch_ms() -> u64 {
@@ -110,7 +110,7 @@ impl SystemHealthProber {
                 slot_dir.display()
             ));
         }
-        if root == Path::new("/srv/muconde") && !slot_dir.join("dist").is_dir() {
+        if is_production_cd_root(root) && !slot_dir.join("dist").is_dir() {
             return Err(format!(
                 "staged dist directory '{}' missing for static web '{service}'",
                 slot_dir.join("dist").display()

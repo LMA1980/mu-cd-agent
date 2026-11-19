@@ -21,7 +21,7 @@ use crate::manifest::AbRulesConfig;
 use crate::sandbox_it::{
     sanitize_relative_path, validate_sha256_digest, verify_sha256_bytes, RegistryAndCasFetcher,
 };
-use crate::slot::{read_active_slot_at, Slot};
+use crate::slot::{is_production_cd_root, read_active_slot_at, Slot};
 
 const MAX_STATIC_WEB_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_WEB_ARCHIVE_STAGING_DIR: &str = ".dist-staging";
@@ -143,9 +143,15 @@ pub const ALLOWED_SERVICES: &[&str] = &[
     "muobservectl",
     "muobserve-collector",
     "muobserve-sentinel",
+    "musentinel",
     "model-runner",
     "k3-manager",
     "jero-manager",
+    "jero-engine",
+    "jero-worker",
+    "k3-worker",
+    "jero-kv-cache",
+    "k3-kv",
     "mu-ci-worker",
     "mu-ci-controller",
     "mu-registry",
@@ -183,17 +189,16 @@ pub fn candidate_binary_names(service: &str) -> &'static [&'static str] {
         "muobserve" | "muobservectl" | "mu-observable-hub" => {
             &["mu-observable-hub", "muobservectl", "muobserve"]
         }
-        "muobserve-collector" | "mu-observable-collector" => &[
-            "mu-observable-collector",
-            "muobserve-collector",
-            "muobserve-sentinel",
-        ],
-        "muobserve-sentinel" | "mu-observable-sentinel" => {
-            &["mu-observable-sentinel", "muobserve-sentinel"]
+        "muobserve-collector" | "mu-observable-collector" => {
+            &["mu-observable-collector", "muobserve-collector"]
         }
-        "model-runner" | "jero-runner" | "k3-manager" | "jero-manager" => {
-            &["k3-manager", "model-runner", "jero-runner"]
+        "musentinel" | "muobserve-sentinel" | "mu-observable-sentinel" => {
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
         }
+        "jero-manager" | "k3-manager" => &["jero-manager", "k3-manager"],
+        "jero-engine" | "jero-worker" | "k3-worker" => &["jero-engine", "jero-worker", "k3-worker"],
+        "jero-kv-cache" | "k3-kv" => &["jero-kv-cache", "k3-kv"],
+        "jero-runner" | "model-runner" => &["jero-engine", "jero-worker", "k3-worker"],
         _ => &[],
     }
 }
@@ -218,15 +223,16 @@ pub fn candidate_systemd_units(service: &str) -> Vec<String> {
         "muobserve" | "muobservectl" | "mu-observable-hub" => {
             &["mu-observable-hub", "muobserve", "muobservectl"]
         }
-        "muobserve-collector" | "mu-observable-collector" => &[
-            "mu-observable-collector",
-            "muobserve-collector",
-            "muobserve-sentinel",
-        ],
-        "muobserve-sentinel" | "mu-observable-sentinel" => {
-            &["mu-observable-sentinel", "muobserve-sentinel"]
+        "muobserve-collector" | "mu-observable-collector" => {
+            &["mu-observable-collector", "muobserve-collector"]
         }
-        "k3-manager" | "jero-manager" => &["k3-manager", "jero-manager"],
+        "musentinel" | "muobserve-sentinel" | "mu-observable-sentinel" => {
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
+        }
+        "jero-manager" | "k3-manager" => &["jero-manager", "k3-manager"],
+        "jero-engine" | "jero-worker" | "k3-worker" => &["jero-engine", "jero-worker"],
+        "jero-kv-cache" | "k3-kv" => &["jero-kv-cache", "k3-kv"],
+        "jero-runner" | "model-runner" => &["jero-runner", "model-runner"],
         other => &[other],
     };
     let mut units = Vec::with_capacity(names.len());
@@ -237,6 +243,37 @@ pub fn candidate_systemd_units(service: &str) -> Vec<String> {
         }
     }
     units
+}
+
+/// Resolves the default CAS blob root (`/var/lib/mu-registry` before legacy `/var/lib/muregist`).
+pub(crate) fn resolve_default_cas_dir(is_dir: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    [
+        Path::new("/var/lib/mu-registry"),
+        Path::new("/var/lib/muregist"),
+    ]
+    .into_iter()
+    .find(|p| is_dir(p))
+    .map(Path::to_path_buf)
+}
+
+/// Returns ordered candidate git repository paths for static web asset staging, checking
+/// `/var/lib/mu-ci-worker/workspace/repos/...` before legacy `/var/lib/action-runner/workspace/repos/...`.
+pub(crate) fn static_web_repo_candidates(service: &str) -> &'static [&'static str] {
+    match service {
+        "muconsole" | "mu-console" => &[
+            "/home/lma1980/repository/mu-console",
+            "/var/lib/mu-ci-worker/workspace/repos/LMA1980/mu-console",
+            "/var/lib/action-runner/workspace/repos/LMA1980/mu-console",
+            "/home/lma1980/repository/MuConsole",
+        ],
+        "action-runner-web" | "mu-ci-web" => &[
+            "/home/lma1980/repository/mu-ci-web",
+            "/var/lib/mu-ci-worker/workspace/repos/LMA1980/mu-ci-web",
+            "/var/lib/action-runner/workspace/repos/LMA1980/mu-ci-web",
+            "/home/lma1980/repository/ActionRunner-web",
+        ],
+        _ => &[],
+    }
 }
 
 /// Validates a service name against path-traversal patterns and the platform allowlist.
@@ -628,11 +665,8 @@ impl BtrfsManager {
 
     fn effective_artifact_fetcher(&self) -> Option<RegistryAndCasFetcher> {
         let fallback_cas = self.cas_blobs_dir.clone().or_else(|| {
-            if self.root_dir == Path::new("/srv/muconde") {
-                let default_cas = PathBuf::from("/var/lib/muregist");
-                if default_cas.is_dir() {
-                    return Some(default_cas);
-                }
+            if is_production_cd_root(&self.root_dir) {
+                return resolve_default_cas_dir(|p| p.is_dir());
             }
             None
         });
@@ -908,7 +942,7 @@ impl BtrfsManager {
         }
 
         if is_static_web_service(service) {
-            if self.root_dir == Path::new("/srv/muconde") {
+            if is_production_cd_root(&self.root_dir) {
                 validate_sha256_digest(digest)?;
             }
             let expected_sha = if validate_sha256_digest(digest).is_ok() {
@@ -1061,20 +1095,10 @@ impl BtrfsManager {
         slot_dir: &Path,
         git_commit: &str,
     ) -> Result<(), AgentError> {
-        let repo_candidates: &[&str] = match service {
-            "muconsole" | "mu-console" => &[
-                "/home/lma1980/repository/mu-console",
-                "/var/lib/action-runner/workspace/repos/LMA1980/mu-console",
-                "/home/lma1980/repository/MuConsole",
-            ],
-            "action-runner-web" | "mu-ci-web" => &[
-                "/home/lma1980/repository/mu-ci-web",
-                "/var/lib/action-runner/workspace/repos/LMA1980/mu-ci-web",
-                "/home/lma1980/repository/ActionRunner-web",
-            ],
-            _ => &[],
-        };
-        let paths: Vec<&Path> = repo_candidates.iter().map(Path::new).collect();
+        let paths: Vec<&Path> = static_web_repo_candidates(service)
+            .iter()
+            .map(Path::new)
+            .collect();
         self.stage_static_web_bundle_from_git_repos(slot_dir, git_commit, &paths)
     }
 
@@ -1169,8 +1193,8 @@ impl BtrfsManager {
         )))
     }
 
-    /// Ensures `candidate_path` (`/srv/muconde/staging/<artifact_sha256>`) exists and strictly
-    /// matches `artifact_sha256`.
+    /// Ensures `candidate_path` (`/srv/mucd/staging/<artifact_sha256>` or legacy
+    /// `/srv/muconde/staging/<artifact_sha256>`) exists and strictly matches `artifact_sha256`.
     ///
     /// Fails closed on any invalid SHA-256 digest, on-disk checksum mismatch, or missing verified
     /// CAS / `mu-registry` artifact. Never synthesizes shell stubs or copies unverified host
@@ -1558,15 +1582,34 @@ mod tests {
         );
         assert_eq!(
             candidate_binary_names("muobserve-collector"),
-            &[
-                "mu-observable-collector",
-                "muobserve-collector",
-                "muobserve-sentinel",
+            &["mu-observable-collector", "muobserve-collector"]
+        );
+        assert_eq!(
+            candidate_binary_names("mu-observable-collector"),
+            &["mu-observable-collector", "muobserve-collector"]
+        );
+        assert_eq!(
+            candidate_systemd_units("mu-observable-collector"),
+            vec![
+                "mu-observable-collector.service".to_string(),
+                "muobserve-collector.service".to_string(),
             ]
         );
         assert_eq!(
             candidate_binary_names("muobserve-sentinel"),
-            &["mu-observable-sentinel", "muobserve-sentinel"]
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
+        );
+        assert_eq!(
+            candidate_binary_names("musentinel"),
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
+        );
+        assert_eq!(
+            candidate_systemd_units("mu-observable-sentinel"),
+            vec![
+                "mu-observable-sentinel.service".to_string(),
+                "musentinel.service".to_string(),
+                "muobserve-sentinel.service".to_string(),
+            ]
         );
         assert_eq!(
             candidate_binary_names("muconde-agent"),
@@ -1577,6 +1620,120 @@ mod tests {
             &["mu-cd-controller", "muconde-controller"]
         );
         assert_eq!(candidate_binary_names("action-runner")[0], "mu-ci-worker");
+
+        // AI runtime services separated cleanly with canonical names first
+        assert_eq!(
+            candidate_binary_names("jero-manager"),
+            &["jero-manager", "k3-manager"]
+        );
+        assert_eq!(
+            candidate_binary_names("k3-manager"),
+            &["jero-manager", "k3-manager"]
+        );
+        assert_eq!(
+            candidate_systemd_units("jero-manager"),
+            vec![
+                "jero-manager.service".to_string(),
+                "k3-manager.service".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            candidate_binary_names("jero-engine"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            candidate_binary_names("jero-worker"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            candidate_binary_names("k3-worker"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            candidate_systemd_units("jero-engine"),
+            vec![
+                "jero-engine.service".to_string(),
+                "jero-worker.service".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            candidate_binary_names("jero-kv-cache"),
+            &["jero-kv-cache", "k3-kv"]
+        );
+        assert_eq!(candidate_binary_names("k3-kv"), &["jero-kv-cache", "k3-kv"]);
+        assert_eq!(
+            candidate_systemd_units("jero-kv-cache"),
+            vec![
+                "jero-kv-cache.service".to_string(),
+                "k3-kv.service".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            candidate_binary_names("jero-runner"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            candidate_binary_names("model-runner"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            candidate_systemd_units("jero-runner"),
+            vec![
+                "jero-runner.service".to_string(),
+                "model-runner.service".to_string(),
+            ]
+        );
+
+        for svc in [
+            "jero-engine",
+            "jero-worker",
+            "k3-worker",
+            "jero-kv-cache",
+            "k3-kv",
+            "musentinel",
+        ] {
+            assert!(
+                validate_service_name(svc).is_ok(),
+                "{svc} must be allowlisted in ALLOWED_SERVICES"
+            );
+        }
+
+        // CAS default prefers /var/lib/mu-registry before /var/lib/muregist
+        assert_eq!(resolve_default_cas_dir(|_| false), None);
+        assert_eq!(
+            resolve_default_cas_dir(|p| p == Path::new("/var/lib/muregist")),
+            Some(PathBuf::from("/var/lib/muregist"))
+        );
+        assert_eq!(
+            resolve_default_cas_dir(|_| true),
+            Some(PathBuf::from("/var/lib/mu-registry"))
+        );
+
+        // Static web repo candidates prioritize mu-ci-worker workspace ahead of action-runner
+        let console_repos = static_web_repo_candidates("mu-console");
+        let ci_worker_idx = console_repos
+            .iter()
+            .position(|p| p.contains("/var/lib/mu-ci-worker/"))
+            .unwrap();
+        let action_runner_idx = console_repos
+            .iter()
+            .position(|p| p.contains("/var/lib/action-runner/"))
+            .unwrap();
+        assert!(ci_worker_idx < action_runner_idx);
+
+        let web_repos = static_web_repo_candidates("mu-ci-web");
+        let web_ci_idx = web_repos
+            .iter()
+            .position(|p| p.contains("/var/lib/mu-ci-worker/"))
+            .unwrap();
+        let web_ar_idx = web_repos
+            .iter()
+            .position(|p| p.contains("/var/lib/action-runner/"))
+            .unwrap();
+        assert!(web_ci_idx < web_ar_idx);
 
         assert_eq!(
             candidate_systemd_units("mu-console"),
