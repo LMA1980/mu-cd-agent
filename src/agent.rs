@@ -789,7 +789,11 @@ impl MuConDeAgent {
             node_id = %self.config.node_id,
             "MuConDe-agent daemon listening for controller RPCs"
         );
+        self.run_with_listener(listener).await
+    }
 
+    /// Serves incoming mTLS or plaintext IPC connections on an already-bound `listener`.
+    pub async fn run_with_listener(&self, listener: TcpListener) -> Result<(), AgentError> {
         let tls_acceptor = if let (Some(ca), Some(cert), Some(key)) = (
             &self.config.tls_ca_path,
             &self.config.tls_cert_path,
@@ -813,11 +817,11 @@ impl MuConDeAgent {
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
                             if let Err(e) = conn_agent.handle_connection(tls_stream).await {
-                                tracing::error!("Connection error: {}", e);
+                                tracing::warn!("Connection error: {}", e);
                             }
                         }
                         Err(e) => {
-                            tracing::error!("TLS handshake failed: {}", e);
+                            tracing::warn!("TLS handshake failed: {}", e);
                         }
                     }
                 });
@@ -826,7 +830,7 @@ impl MuConDeAgent {
 
                 tokio::spawn(async move {
                     if let Err(e) = conn_agent.handle_connection(stream).await {
-                        tracing::error!("Connection error: {}", e);
+                        tracing::warn!("Connection error: {}", e);
                     }
                 });
             }
