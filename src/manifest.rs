@@ -96,6 +96,8 @@ pub struct DeploymentConfig {
     pub systemd_unit: Option<String>,
     pub web_root: Option<String>,
     pub artifact: Option<String>,
+    #[serde(default)]
+    pub self_upgrade_guard: bool,
 }
 
 impl DeploymentConfig {
@@ -292,8 +294,10 @@ deployment:
   binary: "mu-cd-agent"
   install_path: "/usr/local/bin/mu-cd-agent"
   systemd_unit: "mu-cd-agent"
+  self_upgrade_guard: true
 "#;
         let daemon = MuCdManifest::from_yaml_str(yaml_daemon).expect("parse daemon manifest");
+        assert!(daemon.deployment.self_upgrade_guard);
         assert_eq!(
             daemon.target_nodes,
             vec!["node-a", "worker-riscv64", "worker-aarch64"]

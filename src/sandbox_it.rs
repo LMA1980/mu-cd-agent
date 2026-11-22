@@ -904,9 +904,59 @@ pub fn validate_scenario_args(args: &[String]) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// Parses and validates a `unix:///run/...` or `unix:///var/run/...` socket URL.
+/// Returns `Ok(None)` when `raw` does not use the `unix://` scheme, and fails closed on
+/// traversal (`..`), whitespace, NUL bytes, or paths outside `/run/` and `/var/run/`.
+pub fn parse_unix_socket_url(raw: &str) -> Result<Option<PathBuf>, AgentError> {
+    let trimmed = raw.trim();
+    let Some(path_str) = trimmed.strip_prefix("unix://") else {
+        return Ok(None);
+    };
+    if path_str.is_empty()
+        || path_str.contains('\0')
+        || path_str.contains("..")
+        || path_str.bytes().any(|b| b.is_ascii_whitespace())
+    {
+        return Err(AgentError::SandboxViolation(format!(
+            "Invalid unix:// socket URL '{raw}': path must be a clean absolute path without traversal or whitespace"
+        )));
+    }
+    let Some(clean) = normalize_clean_path(Path::new(path_str)) else {
+        return Err(AgentError::SandboxViolation(format!(
+            "Invalid unix:// socket URL '{raw}': path must be clean and absolute"
+        )));
+    };
+    let under_run = (clean.starts_with("/run") && clean != Path::new("/run"))
+        || (clean.starts_with("/var/run") && clean != Path::new("/var/run"));
+    if !under_run {
+        return Err(AgentError::SandboxViolation(format!(
+            "unix:// socket path '{}' must reside beneath /run/ or /var/run/",
+            clean.display()
+        )));
+    }
+    Ok(Some(clean))
+}
+
+/// Extracts deduplicated, validated Unix domain socket paths from `MU_SMOKE_TARGET_URL`
+/// and `MU_SMOKE_TARGET_ADDR` entries using the `unix://` scheme.
+pub fn extract_scenario_unix_sockets(allowlisted_env: &[(String, String)]) -> Vec<PathBuf> {
+    let mut sockets = Vec::new();
+    for (key, value) in allowlisted_env {
+        if matches!(key.as_str(), "MU_SMOKE_TARGET_URL" | "MU_SMOKE_TARGET_ADDR") {
+            if let Ok(Some(path)) = parse_unix_socket_url(value) {
+                if !sockets.contains(&path) {
+                    sockets.push(path);
+                }
+            }
+        }
+    }
+    sockets
+}
+
 /// Validates scenario environment overrides against the fixed `ALLOWED_SCENARIO_ENV_KEYS`
-/// allowlist, rejecting NUL bytes, invalid `RUST_BACKTRACE`/`MU_SMOKE_TIMEOUT_SECS` values, and
-/// any `MU_SMOKE_*_FILE` value not present in `validated_ro_mounts`.
+/// allowlist, rejecting NUL bytes, invalid `RUST_BACKTRACE`/`MU_SMOKE_TIMEOUT_SECS` values,
+/// invalid `unix://` target socket paths, and any `MU_SMOKE_*_FILE` value not present in
+/// `validated_ro_mounts`.
 pub fn validate_allowlisted_env(
     env: &[(String, String)],
     validated_ro_mounts: &[PathBuf],
@@ -940,6 +990,11 @@ pub fn validate_allowlisted_env(
                 ));
             }
         }
+        if matches!(key.as_str(), "MU_SMOKE_TARGET_URL" | "MU_SMOKE_TARGET_ADDR")
+            && value.trim().starts_with("unix://")
+        {
+            let _ = parse_unix_socket_url(value)?;
+        }
         if FILE_MOUNT_ENV_KEYS.contains(&key.as_str()) {
             let Some(clean_file) = normalize_clean_path(Path::new(value)) else {
                 return Err(AgentError::SandboxViolation(format!(
@@ -967,11 +1022,28 @@ fn normalize_network_mode(mode: &NetworkEgressMode) -> NetworkEgressMode {
     }
 }
 
+/// Returns the validated parent directory under `/run/` or `/var/run/` for a validated Unix socket
+/// path (e.g. `/run/k3/worker.sock` -> `/run/k3`), or the socket path itself if directly inside
+/// `/run/` or `/var/run/`. Never widens to `/run`, `/var/run`, or `/`.
+fn unix_socket_read_mount_target(sock: &Path) -> PathBuf {
+    if let Some(parent) = sock.parent() {
+        if parent != Path::new("/")
+            && parent != Path::new("/run")
+            && parent != Path::new("/var/run")
+            && (parent.starts_with("/run") || parent.starts_with("/var/run"))
+        {
+            return parent.to_path_buf();
+        }
+    }
+    sock.to_path_buf()
+}
+
 fn resolve_host_ceiling(
     cfg: &ItSandboxConfig,
     canon_work: &Path,
     work_dir: &Path,
     sandbox_tmp: &Path,
+    validated_unix_sockets: &[PathBuf],
 ) -> Result<HostCeilingConfig, AgentError> {
     if let Some(ref ceiling_path) = cfg.host_ceiling_path {
         let mut ceiling = HostCeilingConfig::from_path(ceiling_path).map_err(|e| {
@@ -992,6 +1064,10 @@ fn resolve_host_ceiling(
         .collect();
     push_unique_clean(&mut allowed_read_prefixes, canon_work);
     push_unique_clean(&mut allowed_read_prefixes, work_dir);
+    for sock in validated_unix_sockets {
+        let mount_target = unix_socket_read_mount_target(sock);
+        push_unique_clean(&mut allowed_read_prefixes, &mount_target);
+    }
 
     let mut allowed_write_prefixes = vec![PathBuf::from("/tmp")];
     push_unique_clean(&mut allowed_write_prefixes, sandbox_tmp);
@@ -1021,6 +1097,7 @@ fn resolve_host_ceiling(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_profile_and_task(
     cfg: &ItSandboxConfig,
     ceiling: &HostCeilingConfig,
@@ -1028,6 +1105,7 @@ fn build_profile_and_task(
     work_dir: &Path,
     sandbox_tmp: &Path,
     validated_ro_mounts: &[PathBuf],
+    validated_unix_sockets: &[PathBuf],
     network_mode: NetworkEgressMode,
 ) -> Result<(DesiredProfileConfig, TaskSandboxConfig), AgentError> {
     if let Some(ref sec_path) = cfg.security_file_path {
@@ -1044,7 +1122,8 @@ fn build_profile_and_task(
             })?
             .clone();
 
-        let task_read_paths = if validated_ro_mounts.is_empty() {
+        let task_read_paths = if validated_ro_mounts.is_empty() && validated_unix_sockets.is_empty()
+        {
             Vec::new()
         } else {
             let mut reads = Vec::new();
@@ -1059,6 +1138,10 @@ fn build_profile_and_task(
             }
             for mount in validated_ro_mounts {
                 push_unique_clean(&mut reads, mount);
+            }
+            for sock in validated_unix_sockets {
+                let mount_target = unix_socket_read_mount_target(sock);
+                push_unique_clean(&mut reads, &mount_target);
             }
             reads
         };
@@ -1092,6 +1175,10 @@ fn build_profile_and_task(
     }
     for mount in validated_ro_mounts {
         push_unique_clean(&mut read_paths, mount);
+    }
+    for sock in validated_unix_sockets {
+        let mount_target = unix_socket_read_mount_target(sock);
+        push_unique_clean(&mut read_paths, &mount_target);
     }
 
     let mut write_paths = Vec::new();
@@ -1196,10 +1283,17 @@ pub fn build_it_sandbox_plan(
     validate_scenario_args(&cfg.extra_args)?;
     let validated_ro_mounts = validate_ro_mounts(&cfg.ro_mounts)?;
     validate_allowlisted_env(&cfg.allowlisted_env, &validated_ro_mounts)?;
+    let validated_unix_sockets = extract_scenario_unix_sockets(&cfg.allowlisted_env);
 
     let canon_work = fs::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
     let sandbox_tmp = canon_work.join(".sandbox_tmp");
-    let ceiling = resolve_host_ceiling(cfg, &canon_work, work_dir, &sandbox_tmp)?;
+    let ceiling = resolve_host_ceiling(
+        cfg,
+        &canon_work,
+        work_dir,
+        &sandbox_tmp,
+        &validated_unix_sockets,
+    )?;
     let network_mode = normalize_network_mode(&cfg.network_mode);
     let (desired_profile, task) = build_profile_and_task(
         cfg,
@@ -1208,6 +1302,7 @@ pub fn build_it_sandbox_plan(
         work_dir,
         &sandbox_tmp,
         &validated_ro_mounts,
+        &validated_unix_sockets,
         network_mode,
     )?;
 
@@ -1457,22 +1552,36 @@ pub fn parse_tcp_endpoint_from_url(raw: &str) -> Option<(String, u16)> {
 }
 
 /// Extracts deduplicated `(host, port)` TCP targets from a scenario's allowlisted environment
-/// variables (`MU_SMOKE_TARGET_ADDR` and `MU_SMOKE_TARGET_URL`).
+/// variables (`MU_SMOKE_TARGET_ADDR` and `MU_SMOKE_TARGET_URL`). When one or more valid
+/// `MU_SMOKE_TARGET_ADDR` entries are present, they take precedence over `MU_SMOKE_TARGET_URL`
+/// so virtual-host scenarios probe the local node endpoint rather than a remote DNS alias.
 pub fn extract_scenario_tcp_endpoints(allowlisted_env: &[(String, String)]) -> Vec<(String, u16)> {
-    let mut endpoints: Vec<(String, u16)> = Vec::new();
+    let mut addr_endpoints: Vec<(String, u16)> = Vec::new();
+    let mut url_endpoints: Vec<(String, u16)> = Vec::new();
     for (key, value) in allowlisted_env {
-        let parsed = match key.as_str() {
-            "MU_SMOKE_TARGET_ADDR" => parse_tcp_endpoint_from_addr(value),
-            "MU_SMOKE_TARGET_URL" => parse_tcp_endpoint_from_url(value),
-            _ => None,
-        };
-        if let Some(ep) = parsed {
-            if !endpoints.contains(&ep) {
-                endpoints.push(ep);
+        match key.as_str() {
+            "MU_SMOKE_TARGET_ADDR" => {
+                if let Some(ep) = parse_tcp_endpoint_from_addr(value) {
+                    if !addr_endpoints.contains(&ep) {
+                        addr_endpoints.push(ep);
+                    }
+                }
             }
+            "MU_SMOKE_TARGET_URL" => {
+                if let Some(ep) = parse_tcp_endpoint_from_url(value) {
+                    if !url_endpoints.contains(&ep) {
+                        url_endpoints.push(ep);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    endpoints
+    if !addr_endpoints.is_empty() {
+        addr_endpoints
+    } else {
+        url_endpoints
+    }
 }
 
 /// Polls each `(host, port)` endpoint at `poll_interval` cadence up to `timeout` until every
@@ -1514,6 +1623,58 @@ pub async fn wait_for_tcp_endpoints_ready(
                 return Err(format!(
                     "Warmup TCP readiness probe timed out after {}ms for {host}:{port} ({last_err})",
                     timeout.as_millis()
+                ));
+            }
+            tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Polls each Unix domain socket path at `poll_interval` cadence up to `timeout` until every
+/// socket file exists as a bound Unix socket (`file_type().is_socket()`). Avoids issuing a
+/// probe `connect()` so single-connection daemons that exit on EOF are not disturbed.
+pub async fn wait_for_unix_sockets_ready(
+    sockets: &[PathBuf],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), String> {
+    if sockets.is_empty() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + timeout;
+    let poll = if poll_interval.is_zero() {
+        Duration::from_millis(50)
+    } else {
+        poll_interval
+    };
+
+    for sock in sockets {
+        loop {
+            let ready = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    fs::symlink_metadata(sock)
+                        .map(|m| m.file_type().is_socket())
+                        .unwrap_or(false)
+                }
+                #[cfg(not(unix))]
+                {
+                    sock.exists()
+                }
+            };
+            if ready {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Warmup Unix socket readiness probe timed out after {}ms for {}",
+                    timeout.as_millis(),
+                    sock.display()
                 ));
             }
             tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
@@ -2425,6 +2586,23 @@ allow_spacemit_ai_thread: false
                 ("node-b.example".to_string(), 8446),
             ]
         );
+
+        // When MU_SMOKE_TARGET_ADDR is supplied alongside a vhost MU_SMOKE_TARGET_URL,
+        // warmup must probe only MU_SMOKE_TARGET_ADDR rather than the remote DNS vhost.
+        let vhost_env = vec![
+            (
+                "MU_SMOKE_TARGET_URL".to_string(),
+                "http://console.example".to_string(),
+            ),
+            (
+                "MU_SMOKE_TARGET_ADDR".to_string(),
+                "192.0.2.201:80".to_string(),
+            ),
+        ];
+        assert_eq!(
+            extract_scenario_tcp_endpoints(&vhost_env),
+            vec![("192.0.2.201".to_string(), 80)]
+        );
     }
 
     #[tokio::test]
@@ -2466,5 +2644,113 @@ allow_spacemit_ai_thread: false
         .await
         .unwrap_err();
         assert!(err.contains("Warmup TCP readiness probe timed out"));
+    }
+
+    #[test]
+    fn test_unix_socket_url_validation_and_sandbox_read_path_miri_safe() {
+        assert_eq!(
+            parse_unix_socket_url("unix:///run/k3/worker.sock").unwrap(),
+            Some(PathBuf::from("/run/k3/worker.sock"))
+        );
+        assert_eq!(
+            parse_unix_socket_url("unix:///var/run/demo/app.sock").unwrap(),
+            Some(PathBuf::from("/var/run/demo/app.sock"))
+        );
+        assert_eq!(
+            parse_unix_socket_url("http://127.0.0.1:8080").unwrap(),
+            None
+        );
+
+        for bad in [
+            "unix://",
+            "unix:///run",
+            "unix:///run/",
+            "unix:///var/run",
+            "unix:///tmp/evil.sock",
+            "unix:///etc/passwd",
+            "unix:///run/../etc/shadow",
+            "unix:///run/k3/bad name.sock",
+        ] {
+            assert!(
+                parse_unix_socket_url(bad).is_err(),
+                "expected unix URL '{bad}' to be rejected"
+            );
+        }
+
+        let env = vec![(
+            "MU_SMOKE_TARGET_URL".to_string(),
+            "unix:///run/k3/worker.sock".to_string(),
+        )];
+        assert!(validate_allowlisted_env(&env, &[]).is_ok());
+        assert_eq!(
+            extract_scenario_unix_sockets(&env),
+            vec![PathBuf::from("/run/k3/worker.sock")]
+        );
+        assert!(validate_allowlisted_env(
+            &[(
+                "MU_SMOKE_TARGET_URL".to_string(),
+                "unix:///etc/shadow".to_string(),
+            )],
+            &[]
+        )
+        .is_err());
+
+        let work = Path::new("/tmp/mu-cd-unix-plan-test");
+        let argv = vec![OsString::from("/tmp/mu-cd-unix-plan-test/smoke_demo")];
+        let cfg = ItSandboxConfig {
+            allowlisted_env: env,
+            ..Default::default()
+        };
+        let (policy, _plan) = build_it_sandbox_plan(work, &argv, &cfg).unwrap();
+        assert!(
+            policy.read_paths.contains(&PathBuf::from("/run/k3")),
+            "validated unix socket parent dir must be granted in Landlock read_paths"
+        );
+        assert!(
+            !policy.read_paths.contains(&PathBuf::from("/run")),
+            "must grant ONLY validated parent dir, never /run"
+        );
+        assert!(
+            !policy.write_paths.contains(&PathBuf::from("/run/k3"))
+                && !policy
+                    .write_paths
+                    .contains(&PathBuf::from("/run/k3/worker.sock")),
+            "unix socket target must remain read-only (never added to write_paths)"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_wait_for_unix_sockets_ready_succeeds_after_delayed_bind() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("worker.sock");
+        let bind_path = sock_path.clone();
+
+        let binder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _listener = tokio::net::UnixListener::bind(&bind_path).unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+
+        let start = Instant::now();
+        wait_for_unix_sockets_ready(
+            std::slice::from_ref(&sock_path),
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("delayed unix socket must become ready within warmup timeout");
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        binder.await.unwrap();
+
+        let missing = dir.path().join("never-bound.sock");
+        let err = wait_for_unix_sockets_ready(
+            &[missing],
+            Duration::from_millis(150),
+            Duration::from_millis(40),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Warmup Unix socket readiness probe timed out"));
     }
 }
