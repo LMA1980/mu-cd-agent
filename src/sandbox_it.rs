@@ -1357,16 +1357,170 @@ impl SandboxedCommandExecutor for KernelSandboxedExecutor {
                 passed: false,
                 exit_code: None,
                 duration_ms,
-                log_output: format!(
-                    "Sandboxed test '{}' timed out after {}s",
-                    test.name,
-                    timeout.as_secs()
+                log_output: sanitize_and_bound_log_excerpt(
+                    &format!(
+                        "Sandboxed test '{}' timed out after {}s",
+                        test.name,
+                        timeout.as_secs()
+                    ),
+                    MAX_LOG_EXCERPT_BYTES,
                 ),
                 effective_policy,
                 execution_plan,
             }),
         }
     }
+}
+
+/// Default retry cadence when waiting for scenario TCP endpoints to bind during warmup.
+pub const TCP_WARMUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Per-attempt TCP connect timeout during warmup readiness probing.
+pub const TCP_WARMUP_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Parses a `"host:port"` or `"[ipv6]:port"` endpoint string into `(host, port)`.
+pub fn parse_tcp_endpoint_from_addr(raw: &str) -> Option<(String, u16)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, port_str) = rest.split_once("]:")?;
+        if host.is_empty() || host.contains('/') {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then(|| (host.to_string(), port));
+    }
+    let (host, port_str) = trimmed.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') || host.contains('/') {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    (port > 0).then(|| (host.to_string(), port))
+}
+
+/// Parses an `http://` or `https://` target URL into `(host, port)`, applying default ports
+/// (`80` / `443`) when omitted.
+pub fn parse_tcp_endpoint_from_url(raw: &str) -> Option<(String, u16)> {
+    let trimmed = raw.trim();
+    let (scheme, after_scheme) = trimmed.split_once("://")?;
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        return None;
+    };
+
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, trailing) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = if trailing.is_empty() {
+            default_port
+        } else {
+            let port_str = trailing.strip_prefix(':')?;
+            let parsed: u16 = port_str.parse().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            parsed
+        };
+        return Some((host.to_string(), port));
+    }
+
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        (port > 0).then(|| (host.to_string(), port))
+    } else {
+        Some((host_port.to_string(), default_port))
+    }
+}
+
+/// Extracts deduplicated `(host, port)` TCP targets from a scenario's allowlisted environment
+/// variables (`MU_SMOKE_TARGET_ADDR` and `MU_SMOKE_TARGET_URL`).
+pub fn extract_scenario_tcp_endpoints(allowlisted_env: &[(String, String)]) -> Vec<(String, u16)> {
+    let mut endpoints: Vec<(String, u16)> = Vec::new();
+    for (key, value) in allowlisted_env {
+        let parsed = match key.as_str() {
+            "MU_SMOKE_TARGET_ADDR" => parse_tcp_endpoint_from_addr(value),
+            "MU_SMOKE_TARGET_URL" => parse_tcp_endpoint_from_url(value),
+            _ => None,
+        };
+        if let Some(ep) = parsed {
+            if !endpoints.contains(&ep) {
+                endpoints.push(ep);
+            }
+        }
+    }
+    endpoints
+}
+
+/// Polls each `(host, port)` endpoint at `poll_interval` cadence up to `timeout` until every
+/// target accepts a TCP connection.
+pub async fn wait_for_tcp_endpoints_ready(
+    endpoints: &[(String, u16)],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), String> {
+    if endpoints.is_empty() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + timeout;
+    let poll = if poll_interval.is_zero() {
+        Duration::from_millis(50)
+    } else {
+        poll_interval
+    };
+
+    for (host, port) in endpoints {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt_timeout =
+                TCP_WARMUP_CONNECT_TIMEOUT.min(remaining.max(Duration::from_millis(50)));
+            let last_err = match tokio::time::timeout(
+                attempt_timeout,
+                tokio::net::TcpStream::connect((host.as_str(), *port)),
+            )
+            .await
+            {
+                Ok(Ok(_stream)) => break,
+                Ok(Err(err)) => err.to_string(),
+                Err(_) => "connect attempt timed out".to_string(),
+            };
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Warmup TCP readiness probe timed out after {}ms for {host}:{port} ({last_err})",
+                    timeout.as_millis()
+                ));
+            }
+            tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2206,5 +2360,111 @@ allow_spacemit_ai_thread: false
         assert!(!bounded.contains("boundary-secret-token"));
         assert!(!bounded.contains("boundary-sec"));
         assert!(bounded.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn test_parse_tcp_endpoints_from_url_and_addr() {
+        assert_eq!(
+            parse_tcp_endpoint_from_addr("node-a.example:8446"),
+            Some(("node-a.example".to_string(), 8446))
+        );
+        assert_eq!(
+            parse_tcp_endpoint_from_addr("[::1]:9443"),
+            Some(("::1".to_string(), 9443))
+        );
+        assert_eq!(parse_tcp_endpoint_from_addr("node-a.example:0"), None);
+        assert_eq!(parse_tcp_endpoint_from_addr("no-port"), None);
+        assert_eq!(parse_tcp_endpoint_from_addr("bad host:8080"), None);
+
+        assert_eq!(
+            parse_tcp_endpoint_from_url("http://192.0.2.10:8000/health?ready=1"),
+            Some(("192.0.2.10".to_string(), 8000))
+        );
+        assert_eq!(
+            parse_tcp_endpoint_from_url("https://cd.example:8445/api/health"),
+            Some(("cd.example".to_string(), 8445))
+        );
+        assert_eq!(
+            parse_tcp_endpoint_from_url("http://192.0.2.10/status"),
+            Some(("192.0.2.10".to_string(), 80))
+        );
+        assert_eq!(
+            parse_tcp_endpoint_from_url("https://registry.example"),
+            Some(("registry.example".to_string(), 443))
+        );
+        assert_eq!(
+            parse_tcp_endpoint_from_url("http://[::1]:8080/health"),
+            Some(("::1".to_string(), 8080))
+        );
+        assert_eq!(
+            parse_tcp_endpoint_from_url("https://[::1]/health"),
+            Some(("::1".to_string(), 443))
+        );
+        assert_eq!(parse_tcp_endpoint_from_url("ftp://192.0.2.10:21"), None);
+        assert_eq!(parse_tcp_endpoint_from_url("http://192.0.2.10:0"), None);
+
+        let env = vec![
+            (
+                "MU_SMOKE_TARGET_URL".to_string(),
+                "http://192.0.2.10:8000/health".to_string(),
+            ),
+            (
+                "MU_SMOKE_TARGET_ADDR".to_string(),
+                "192.0.2.10:8000".to_string(),
+            ),
+            (
+                "MU_SMOKE_TARGET_ADDR".to_string(),
+                "node-b.example:8446".to_string(),
+            ),
+            ("RUST_BACKTRACE".to_string(), "1".to_string()),
+        ];
+        assert_eq!(
+            extract_scenario_tcp_endpoints(&env),
+            vec![
+                ("192.0.2.10".to_string(), 8000),
+                ("node-b.example".to_string(), 8446),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_wait_for_tcp_endpoints_ready_succeeds_after_delayed_bind() {
+        let probe_sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe_sock.local_addr().unwrap().port();
+        drop(probe_sock);
+
+        let binder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let _ = listener.accept().await;
+        });
+
+        let endpoints = vec![("127.0.0.1".to_string(), port)];
+        let start = Instant::now();
+        wait_for_tcp_endpoints_ready(
+            &endpoints,
+            Duration::from_secs(3),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("delayed loopback listener must become ready within warmup timeout");
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        binder.await.unwrap();
+
+        // Unbound port fails cleanly when timeout elapses
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused_port = unused.local_addr().unwrap().port();
+        drop(unused);
+        let err = wait_for_tcp_endpoints_ready(
+            &[("127.0.0.1".to_string(), unused_port)],
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Warmup TCP readiness probe timed out"));
     }
 }
