@@ -9,6 +9,7 @@ use mu_cd_agent::slot::default_cd_root_with;
 use mu_cd_agent::{
     builtin_catalog, first_non_empty_var, IntegrationTestSelection, ItSandboxConfig, MuCdManifest,
     MuConDeAgent, MuConDeAgentConfig, SystemCommandRunner, SystemHealthProber,
+    DEFAULT_CANARY_PROFILE_PATH, DEFAULT_HOST_CEILING_PATH,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -57,7 +58,7 @@ fn build_agent_config_with(
     let muconde_root =
         first_non_empty_var(lookup, &["MU_CD_AGENT_ROOT", "MU_CD_ROOT", "MUCONDE_ROOT"])
             .map(PathBuf::from)
-            .unwrap_or_else(|| default_cd_root_with(exists));
+            .unwrap_or_else(|| default_cd_root_with(&exists));
 
     let tls_ca_path = first_non_empty_var(
         lookup,
@@ -169,6 +170,37 @@ fn build_agent_config_with(
     let registry_token = resolve_registry_token(lookup);
     let cas_blobs_dir = resolve_cas_blobs_dir(lookup);
 
+    let host_ceiling_path = first_non_empty_var(
+        lookup,
+        &[
+            "MU_CD_AGENT_CEILING_PATH",
+            "MU_CD_CEILING_PATH",
+            "MU_ISOLATION_CEILING_PATH",
+        ],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(DEFAULT_HOST_CEILING_PATH));
+
+    let security_file_path = first_non_empty_var(
+        lookup,
+        &[
+            "MU_CD_AGENT_CANARY_PROFILE_PATH",
+            "MU_CD_AGENT_SECURITY_FILE",
+            "MU_CD_CANARY_PROFILE_PATH",
+        ],
+    )
+    .map(PathBuf::from)
+    .or_else(|| {
+        let default_profile = PathBuf::from(DEFAULT_CANARY_PROFILE_PATH);
+        exists(&default_profile).then_some(default_profile)
+    });
+
+    let it_sandbox = ItSandboxConfig {
+        host_ceiling_path: Some(host_ceiling_path),
+        security_file_path,
+        ..ItSandboxConfig::default()
+    };
+
     Ok(MuConDeAgentConfig {
         node_id,
         listen_addr,
@@ -187,7 +219,7 @@ fn build_agent_config_with(
         registry_url,
         registry_token,
         cas_blobs_dir,
-        it_sandbox: ItSandboxConfig::default(),
+        it_sandbox,
     })
 }
 
@@ -408,6 +440,59 @@ mod tests {
         assert_eq!(
             resolve_registry_token(&|k| map_missing_path_literal.get(k).map(|v| (*v).to_string())),
             None
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_host_ceiling_and_canary_profile_env_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_dir = temp.path().to_str().unwrap().to_string();
+
+        // Default ceiling path when unset; auto-detects canary profile only when present
+        let base_map = HashMap::from([("MU_CD_AGENT_MANIFEST_DIR", manifest_dir.clone())]);
+        let cfg_default =
+            build_agent_config_with(&|k| base_map.get(k).cloned(), |_| false).unwrap();
+        assert_eq!(
+            cfg_default.it_sandbox.host_ceiling_path,
+            Some(PathBuf::from(DEFAULT_HOST_CEILING_PATH))
+        );
+        assert_eq!(cfg_default.it_sandbox.security_file_path, None);
+
+        let cfg_with_profile = build_agent_config_with(&|k| base_map.get(k).cloned(), |p| {
+            p == Path::new(DEFAULT_CANARY_PROFILE_PATH)
+        })
+        .unwrap();
+        assert_eq!(
+            cfg_with_profile.it_sandbox.security_file_path,
+            Some(PathBuf::from(DEFAULT_CANARY_PROFILE_PATH))
+        );
+
+        // Explicit env overrides take precedence
+        let override_map = HashMap::from([
+            ("MU_CD_AGENT_MANIFEST_DIR", manifest_dir),
+            (
+                "MU_CD_AGENT_CEILING_PATH",
+                "/custom/ceiling.yml".to_string(),
+            ),
+            (
+                "MU_ISOLATION_CEILING_PATH",
+                "/fallback/ceiling.yml".to_string(),
+            ),
+            (
+                "MU_CD_AGENT_CANARY_PROFILE_PATH",
+                "/custom/canary-profile.yml".to_string(),
+            ),
+        ]);
+        let cfg_override =
+            build_agent_config_with(&|k| override_map.get(k).cloned(), |_| false).unwrap();
+        assert_eq!(
+            cfg_override.it_sandbox.host_ceiling_path,
+            Some(PathBuf::from("/custom/ceiling.yml"))
+        );
+        assert_eq!(
+            cfg_override.it_sandbox.security_file_path,
+            Some(PathBuf::from("/custom/canary-profile.yml"))
         );
     }
 }

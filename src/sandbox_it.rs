@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use mu_ci_isolation::{
-    register_ai_thread_if_present, resolve_effective_policy, DesiredProfileConfig,
-    DesiredSecurityFile, EffectiveSandboxPolicy, HostCeilingConfig, IsolationBackend,
-    KernelSandbox, NetworkEgressMode, SandboxBackendKind, SandboxExecutionPlan, TaskSandboxConfig,
-    DEFAULT_SET_AI_THREAD_PATH, MAX_K3_MEMLOCK_KB,
+    normalize_clean_path, register_ai_thread_if_present, resolve_effective_policy,
+    DesiredProfileConfig, DesiredSecurityFile, EffectiveSandboxPolicy, HostCeilingConfig,
+    IsolationBackend, KernelSandbox, NetworkEgressMode, SandboxBackendKind, SandboxExecutionPlan,
+    TaskSandboxConfig, DEFAULT_SET_AI_THREAD_PATH, MAX_K3_MEMLOCK_KB, READ_ACCESS,
 };
 use mu_observable_ipc::{DeterministicSecretRedactor, SecretRedactor};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,60 @@ use tar::{Archive, EntryType};
 use crate::error::AgentError;
 use crate::gate::{builtin_catalog, expand_integration_tests, GateTest, IntegrationTestSelection};
 use crate::slot::Slot;
+
+/// Default Layer 1 host ceiling configuration path loaded in production.
+pub const DEFAULT_HOST_CEILING_PATH: &str = "/etc/mu-isolation/ceiling.yml";
+
+/// Default Layer 2 CD canary profile path loaded in production when present.
+pub const DEFAULT_CANARY_PROFILE_PATH: &str = "/etc/mu-isolation/cd-canary-profile.yml";
+
+/// Maximum permitted scenario CLI arguments.
+pub const MAX_SCENARIO_ARGS: usize = 32;
+
+/// Maximum permitted UTF-8 byte length of a single scenario CLI argument.
+pub const MAX_SCENARIO_ARG_BYTES: usize = 4096;
+
+/// Exhaustive allowlist of scenario environment variables injected into sandboxed test processes.
+pub const ALLOWED_SCENARIO_ENV_KEYS: &[&str] = &[
+    "MU_SMOKE_TARGET_URL",
+    "MU_SMOKE_TARGET_ADDR",
+    "MU_SMOKE_TLS_CA_FILE",
+    "MU_SMOKE_TLS_CERT_FILE",
+    "MU_SMOKE_TLS_KEY_FILE",
+    "MU_SMOKE_BEARER_TOKEN_FILE",
+    "MU_SMOKE_TIMEOUT_SECS",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+];
+
+const FILE_MOUNT_ENV_KEYS: &[&str] = &[
+    "MU_SMOKE_TLS_CA_FILE",
+    "MU_SMOKE_TLS_CERT_FILE",
+    "MU_SMOKE_TLS_KEY_FILE",
+    "MU_SMOKE_BEARER_TOKEN_FILE",
+];
+
+const BASELINE_RUNTIME_READ_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/etc/ssl",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+];
+
+const DEFAULT_CANARY_READ_PREFIXES: &[&str] =
+    &["/etc/mu-cd-canary/tls", "/etc/mu-cd-canary/tokens"];
+
+const SENSITIVE_ETC_WRITE_PREFIXES: &[&str] = &[
+    "/etc/mu-cd-canary",
+    "/etc/step-ca",
+    "/etc/muconde",
+    "/etc/mu-cd",
+    "/etc/muregist",
+    "/etc/action-runner",
+];
 
 /// Enforced maximum process/thread count inside `KernelSandbox` for IT bundles.
 pub const MAX_IT_SANDBOX_PIDS: u32 = 256;
@@ -447,6 +501,15 @@ impl RegistryArtifactKind {
 #[async_trait]
 pub trait ItArchiveFetcher: Send + Sync {
     async fn fetch_it_archive(&self, digest: &str) -> Result<Vec<u8>, AgentError>;
+
+    /// Fetches verified IT archive bytes, optionally hinting an explicit `bundle_id` in `mu-registry`.
+    async fn fetch_it_archive_for_bundle(
+        &self,
+        digest: &str,
+        _bundle_id: Option<&str>,
+    ) -> Result<Vec<u8>, AgentError> {
+        self.fetch_it_archive(digest).await
+    }
 }
 
 /// Fetches candidate artifacts and integration test archives from local CAS storage or
@@ -683,6 +746,21 @@ impl ItArchiveFetcher for RegistryAndCasFetcher {
         self.fetch_artifact_by_digest(digest, RegistryArtifactKind::ItArchive)
             .await
     }
+
+    async fn fetch_it_archive_for_bundle(
+        &self,
+        digest: &str,
+        bundle_id: Option<&str>,
+    ) -> Result<Vec<u8>, AgentError> {
+        if let Some(id) = bundle_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let mut scoped = self.clone();
+            scoped.bundle_id = Some(id.to_string());
+            return scoped
+                .fetch_artifact_by_digest(digest, RegistryArtifactKind::ItArchive)
+                .await;
+        }
+        self.fetch_it_archive(digest).await
+    }
 }
 
 /// Configuration for running IT archive tests inside `MuIsolation::KernelSandbox`.
@@ -693,7 +771,16 @@ pub struct ItSandboxConfig {
     pub max_memory_mb: u64,
     pub max_cpu_cores: u32,
     pub network_mode: NetworkEgressMode,
+    /// Optional Layer 1 host ceiling YAML path (`/etc/mu-isolation/ceiling.yml` in production).
+    pub host_ceiling_path: Option<PathBuf>,
+    /// Optional Layer 2 desired security profile YAML path.
     pub security_file_path: Option<PathBuf>,
+    /// Scenario read-only Landlock credential/CA mounts (never writable or executable).
+    pub ro_mounts: Vec<PathBuf>,
+    /// Explicitly allowlisted scenario environment variables injected after `cmd.env_clear()`.
+    pub allowlisted_env: Vec<(String, String)>,
+    /// Explicitly bounded scenario CLI arguments appended to the test command.
+    pub extra_args: Vec<String>,
     pub proc_ai_thread_path: PathBuf,
     pub per_test_timeout_secs: u64,
 }
@@ -706,17 +793,32 @@ impl Default for ItSandboxConfig {
             max_memory_mb: 1024,
             max_cpu_cores: 4,
             network_mode: NetworkEgressMode::Offline,
+            host_ceiling_path: None,
             security_file_path: None,
+            ro_mounts: Vec::new(),
+            allowlisted_env: Vec::new(),
+            extra_args: Vec::new(),
             proc_ai_thread_path: PathBuf::from(DEFAULT_SET_AI_THREAD_PATH),
             per_test_timeout_secs: 30,
         }
     }
 }
 
+/// Normalizes architecture labels for `mu_ci_isolation` seccomp-BPF planner compatibility.
+///
+/// `aarch64` / `arm64` shares the Linux `asm-generic` syscall table with `riscv64gc` for the
+/// kernel-surface denylist enforced by `SeccompFilterBuilder`.
+pub fn normalize_sandbox_arch(raw: &str) -> String {
+    match raw.trim() {
+        "aarch64" | "arm64" | "riscv64" => "riscv64gc".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Canonical architecture identifier accepted by `mu_ci_isolation` seccomp planner.
 pub fn canonical_sandbox_arch() -> &'static str {
     match std::env::consts::ARCH {
-        "riscv64" => "riscv64gc",
+        "riscv64" | "aarch64" => "riscv64gc",
         "x86_64" => "x86_64",
         #[cfg(target_os = "linux")]
         other => other,
@@ -727,67 +829,208 @@ pub fn canonical_sandbox_arch() -> &'static str {
 }
 
 fn push_unique_clean(paths: &mut Vec<PathBuf>, candidate: &Path) {
-    if !candidate.is_absolute() {
+    let Some(clean) = normalize_clean_path(candidate) else {
         return;
-    }
-    if !paths.iter().any(|p| p == candidate) {
-        paths.push(candidate.to_path_buf());
+    };
+    if !paths.iter().any(|p| p == &clean) {
+        paths.push(clean);
     }
 }
 
-/// Evaluates the 3-layer `MuIsolation` security policy (`Ceiling ∩ Profile ∩ Task`) and
-/// produces a validated `KernelSandbox` execution plan capped at `max_pids <= 256`.
-pub fn build_it_sandbox_plan(
-    work_dir: &Path,
-    argv: &[OsString],
+fn is_covered_by_prefixes(candidate: &Path, prefixes: &[PathBuf]) -> bool {
+    let Some(clean_candidate) = normalize_clean_path(candidate) else {
+        return false;
+    };
+    prefixes.iter().any(|prefix| {
+        normalize_clean_path(prefix)
+            .is_some_and(|clean_prefix| clean_candidate.starts_with(&clean_prefix))
+    })
+}
+
+/// Validates scenario read-only Landlock mount paths (strictly normalized absolute, non-root,
+/// zero `..` traversal, zero NUL bytes).
+pub fn validate_ro_mounts(mounts: &[PathBuf]) -> Result<Vec<PathBuf>, AgentError> {
+    let mut validated = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let Some(as_str) = mount.to_str() else {
+            return Err(AgentError::SandboxViolation(
+                "Read-only mount path is not valid UTF-8".to_string(),
+            ));
+        };
+        if as_str.contains('\0') {
+            return Err(AgentError::SandboxViolation(
+                "Read-only mount path contains forbidden NUL byte".to_string(),
+            ));
+        }
+        let Some(clean) = normalize_clean_path(mount) else {
+            return Err(AgentError::SandboxViolation(format!(
+                "Read-only mount '{}' must be a clean absolute path without '..'",
+                mount.display()
+            )));
+        };
+        if clean == Path::new("/") {
+            return Err(AgentError::SandboxViolation(
+                "Read-only mount cannot be bare root '/'".to_string(),
+            ));
+        }
+        if !validated.iter().any(|p| p == &clean) {
+            validated.push(clean);
+        }
+    }
+    Ok(validated)
+}
+
+/// Validates scenario CLI arguments (`<= 32` entries, `<= 4096` bytes each, zero NUL bytes).
+pub fn validate_scenario_args(args: &[String]) -> Result<(), AgentError> {
+    if args.len() > MAX_SCENARIO_ARGS {
+        return Err(AgentError::SandboxViolation(format!(
+            "Scenario argument count {} exceeds maximum of {MAX_SCENARIO_ARGS}",
+            args.len()
+        )));
+    }
+    for arg in args {
+        if arg.contains('\0') {
+            return Err(AgentError::SandboxViolation(
+                "Scenario argument contains forbidden NUL byte".to_string(),
+            ));
+        }
+        if arg.len() > MAX_SCENARIO_ARG_BYTES {
+            return Err(AgentError::SandboxViolation(format!(
+                "Scenario argument length {} exceeds maximum of {MAX_SCENARIO_ARG_BYTES} bytes",
+                arg.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates scenario environment overrides against the fixed `ALLOWED_SCENARIO_ENV_KEYS`
+/// allowlist, rejecting NUL bytes, invalid `RUST_BACKTRACE`/`MU_SMOKE_TIMEOUT_SECS` values, and
+/// any `MU_SMOKE_*_FILE` value not present in `validated_ro_mounts`.
+pub fn validate_allowlisted_env(
+    env: &[(String, String)],
+    validated_ro_mounts: &[PathBuf],
+) -> Result<(), AgentError> {
+    for (key, value) in env {
+        if key.is_empty() || key.contains('\0') || value.contains('\0') {
+            return Err(AgentError::SandboxViolation(
+                "Scenario environment variable key/value cannot be empty or contain NUL bytes"
+                    .to_string(),
+            ));
+        }
+        if !ALLOWED_SCENARIO_ENV_KEYS.contains(&key.as_str()) {
+            return Err(AgentError::SandboxViolation(format!(
+                "Scenario environment variable '{key}' is not in the explicit allowlist"
+            )));
+        }
+        if key == "RUST_BACKTRACE" && value != "0" && value != "1" {
+            return Err(AgentError::SandboxViolation(format!(
+                "Scenario RUST_BACKTRACE must be '0' or '1', got '{value}'"
+            )));
+        }
+        if key == "MU_SMOKE_TIMEOUT_SECS" {
+            let parsed = value.trim().parse::<u64>().map_err(|_| {
+                AgentError::SandboxViolation(format!(
+                    "Scenario MU_SMOKE_TIMEOUT_SECS must be a positive integer, got '{value}'"
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(AgentError::SandboxViolation(
+                    "Scenario MU_SMOKE_TIMEOUT_SECS must be greater than 0".to_string(),
+                ));
+            }
+        }
+        if FILE_MOUNT_ENV_KEYS.contains(&key.as_str()) {
+            let Some(clean_file) = normalize_clean_path(Path::new(value)) else {
+                return Err(AgentError::SandboxViolation(format!(
+                    "Scenario file env '{key}' path '{value}' must be a clean absolute path"
+                )));
+            };
+            if clean_file == Path::new("/") || !validated_ro_mounts.contains(&clean_file) {
+                return Err(AgentError::SandboxViolation(format!(
+                    "Scenario file env '{key}' path '{}' is not covered by validated ro_mounts",
+                    clean_file.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_network_mode(mode: &NetworkEgressMode) -> NetworkEgressMode {
+    match mode {
+        NetworkEgressMode::Offline => NetworkEgressMode::Offline,
+        NetworkEgressMode::RestrictedCidrs(cidrs) if cidrs.is_empty() => NetworkEgressMode::Offline,
+        NetworkEgressMode::RestrictedCidrs(cidrs) => {
+            NetworkEgressMode::RestrictedCidrs(cidrs.clone())
+        }
+    }
+}
+
+fn resolve_host_ceiling(
     cfg: &ItSandboxConfig,
-) -> Result<(EffectiveSandboxPolicy, SandboxExecutionPlan), AgentError> {
-    let canon_work = fs::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
-    let sandbox_tmp = canon_work.join(".sandbox_tmp");
+    canon_work: &Path,
+    work_dir: &Path,
+    sandbox_tmp: &Path,
+) -> Result<HostCeilingConfig, AgentError> {
+    if let Some(ref ceiling_path) = cfg.host_ceiling_path {
+        let mut ceiling = HostCeilingConfig::from_path(ceiling_path).map_err(|e| {
+            AgentError::SandboxViolation(format!(
+                "Failed to load Layer 1 host ceiling '{}': {e}",
+                ceiling_path.display()
+            ))
+        })?;
+        ceiling.arch = normalize_sandbox_arch(&ceiling.arch);
+        ceiling.max_pids = ceiling.max_pids.min(MAX_IT_SANDBOX_PIDS);
+        return Ok(ceiling);
+    }
 
-    let mut read_paths = vec![
-        PathBuf::from("/usr"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/lib"),
-        PathBuf::from("/lib64"),
-        PathBuf::from("/etc"),
-    ];
-    push_unique_clean(&mut read_paths, &canon_work);
-    push_unique_clean(&mut read_paths, work_dir);
+    let mut allowed_read_prefixes: Vec<PathBuf> = BASELINE_RUNTIME_READ_PATHS
+        .iter()
+        .chain(DEFAULT_CANARY_READ_PREFIXES.iter())
+        .map(PathBuf::from)
+        .collect();
+    push_unique_clean(&mut allowed_read_prefixes, canon_work);
+    push_unique_clean(&mut allowed_read_prefixes, work_dir);
 
-    let mut write_paths = vec![PathBuf::from("/tmp")];
-    push_unique_clean(&mut write_paths, &sandbox_tmp);
+    let mut allowed_write_prefixes = vec![PathBuf::from("/tmp")];
+    push_unique_clean(&mut allowed_write_prefixes, sandbox_tmp);
+    push_unique_clean(&mut allowed_write_prefixes, canon_work);
 
-    let mut exec_paths = vec![
+    let mut allowed_exec_prefixes = vec![
         PathBuf::from("/usr/bin"),
         PathBuf::from("/bin"),
         PathBuf::from("/usr/local/bin"),
     ];
-    push_unique_clean(&mut exec_paths, &canon_work);
-    push_unique_clean(&mut exec_paths, work_dir);
+    push_unique_clean(&mut allowed_exec_prefixes, canon_work);
+    push_unique_clean(&mut allowed_exec_prefixes, work_dir);
 
-    let mut ceiling = HostCeilingConfig {
+    Ok(HostCeilingConfig {
         node_id: "mu-cd-agent-it".to_string(),
         arch: canonical_sandbox_arch().to_string(),
         allowed_backends: vec![SandboxBackendKind::Kernel],
-        allowed_read_prefixes: read_paths.clone(),
-        allowed_write_prefixes: write_paths.clone(),
-        allowed_exec_prefixes: exec_paths.clone(),
-        allowed_egress_cidrs: match &cfg.network_mode {
-            NetworkEgressMode::Offline => Vec::new(),
-            NetworkEgressMode::RestrictedCidrs(cidrs) => cidrs.clone(),
-        },
+        allowed_read_prefixes,
+        allowed_write_prefixes,
+        allowed_exec_prefixes,
+        allowed_egress_cidrs: vec!["127.0.0.0/8".to_string()],
         max_memlock_kb: MAX_K3_MEMLOCK_KB,
         max_cpu_cores: cfg.max_cpu_cores.max(1),
         max_memory_mb: cfg.max_memory_mb.max(64),
         max_pids: MAX_IT_SANDBOX_PIDS,
         allow_spacemit_ai_thread: false,
-    };
-    push_unique_clean(&mut ceiling.allowed_write_prefixes, &canon_work);
+    })
+}
 
-    let mut using_security_file = false;
-    let desired_profile = if let Some(ref sec_path) = cfg.security_file_path {
-        using_security_file = true;
+fn build_profile_and_task(
+    cfg: &ItSandboxConfig,
+    ceiling: &HostCeilingConfig,
+    canon_work: &Path,
+    work_dir: &Path,
+    sandbox_tmp: &Path,
+    validated_ro_mounts: &[PathBuf],
+    network_mode: NetworkEgressMode,
+) -> Result<(DesiredProfileConfig, TaskSandboxConfig), AgentError> {
+    if let Some(ref sec_path) = cfg.security_file_path {
         let sec_file = DesiredSecurityFile::from_path(sec_path)
             .map_err(|e| AgentError::SandboxViolation(e.to_string()))?;
         let base = sec_file
@@ -800,64 +1043,173 @@ pub fn build_it_sandbox_plan(
                 ))
             })?
             .clone();
-        DesiredProfileConfig {
-            backend: base.backend,
-            read_paths: base.read_paths,
-            write_paths: base.write_paths,
-            exec_paths: base.exec_paths,
-            network_egress_cidrs: base.network_egress_cidrs,
-            memlock_limit_kb: base.memlock_limit_kb,
-            max_pids: base.max_pids,
-            max_memory_mb: base.max_memory_mb,
-            cpu_affinity_mask: base.cpu_affinity_mask,
-            require_set_ai_thread: base.require_set_ai_thread,
-        }
-    } else {
-        DesiredProfileConfig {
-            backend: SandboxBackendKind::Kernel,
-            read_paths: read_paths.clone(),
-            write_paths: write_paths.clone(),
-            exec_paths: exec_paths.clone(),
-            network_egress_cidrs: match &cfg.network_mode {
-                NetworkEgressMode::Offline => Vec::new(),
-                NetworkEgressMode::RestrictedCidrs(cidrs) => cidrs.clone(),
-            },
-            memlock_limit_kb: cfg.memlock_limit_kb,
-            max_pids: cfg.max_pids.min(MAX_IT_SANDBOX_PIDS),
-            max_memory_mb: Some(cfg.max_memory_mb),
-            cpu_affinity_mask: None,
-            require_set_ai_thread: false,
-        }
-    };
 
-    let task = if using_security_file {
-        TaskSandboxConfig {
+        let task_read_paths = if validated_ro_mounts.is_empty() {
+            Vec::new()
+        } else {
+            let mut reads = Vec::new();
+            for runtime_path in BASELINE_RUNTIME_READ_PATHS {
+                let p = Path::new(runtime_path);
+                if is_covered_by_prefixes(p, &base.read_paths) {
+                    push_unique_clean(&mut reads, p);
+                }
+            }
+            if is_covered_by_prefixes(canon_work, &base.read_paths) {
+                push_unique_clean(&mut reads, canon_work);
+            }
+            for mount in validated_ro_mounts {
+                push_unique_clean(&mut reads, mount);
+            }
+            reads
+        };
+
+        let task = TaskSandboxConfig {
             backend: Some(SandboxBackendKind::Kernel),
-            read_paths: Vec::new(),
+            read_paths: task_read_paths,
             write_paths: Vec::new(),
             exec_paths: Vec::new(),
-            network_mode: cfg.network_mode.clone(),
+            network_mode,
             memlock_limit_kb: (cfg.memlock_limit_kb != DEFAULT_IT_MEMLOCK_KB)
                 .then_some(cfg.memlock_limit_kb),
             max_pids: (cfg.max_pids != MAX_IT_SANDBOX_PIDS).then_some(cfg.max_pids),
             max_memory_mb: (cfg.max_memory_mb != 1024).then_some(cfg.max_memory_mb),
             cpu_affinity_mask: None,
             require_set_ai_thread: None,
+        };
+        return Ok((base, task));
+    }
+
+    let mut read_paths = Vec::new();
+    for runtime_path in BASELINE_RUNTIME_READ_PATHS {
+        let p = Path::new(runtime_path);
+        if is_covered_by_prefixes(p, &ceiling.allowed_read_prefixes) {
+            push_unique_clean(&mut read_paths, p);
         }
-    } else {
-        TaskSandboxConfig {
-            backend: Some(SandboxBackendKind::Kernel),
-            read_paths,
-            write_paths,
-            exec_paths,
-            network_mode: cfg.network_mode.clone(),
-            memlock_limit_kb: Some(cfg.memlock_limit_kb),
-            max_pids: Some(cfg.max_pids),
-            max_memory_mb: Some(cfg.max_memory_mb),
-            cpu_affinity_mask: None,
-            require_set_ai_thread: Some(false),
+    }
+    push_unique_clean(&mut read_paths, canon_work);
+    if is_covered_by_prefixes(work_dir, &ceiling.allowed_read_prefixes) {
+        push_unique_clean(&mut read_paths, work_dir);
+    }
+    for mount in validated_ro_mounts {
+        push_unique_clean(&mut read_paths, mount);
+    }
+
+    let mut write_paths = Vec::new();
+    let tmp_path = Path::new("/tmp");
+    if is_covered_by_prefixes(tmp_path, &ceiling.allowed_write_prefixes) {
+        push_unique_clean(&mut write_paths, tmp_path);
+    }
+    push_unique_clean(&mut write_paths, sandbox_tmp);
+
+    let mut exec_paths = Vec::new();
+    for exec_default in ["/usr/bin", "/bin", "/usr/local/bin"] {
+        let p = Path::new(exec_default);
+        if is_covered_by_prefixes(p, &ceiling.allowed_exec_prefixes) {
+            push_unique_clean(&mut exec_paths, p);
         }
+    }
+    push_unique_clean(&mut exec_paths, canon_work);
+    if is_covered_by_prefixes(work_dir, &ceiling.allowed_exec_prefixes) {
+        push_unique_clean(&mut exec_paths, work_dir);
+    }
+
+    let ceiling_memlock = ceiling.max_memlock_kb.min(MAX_K3_MEMLOCK_KB);
+    let desired_profile = DesiredProfileConfig {
+        backend: SandboxBackendKind::Kernel,
+        read_paths: read_paths.clone(),
+        write_paths: write_paths.clone(),
+        exec_paths: exec_paths.clone(),
+        network_egress_cidrs: ceiling.allowed_egress_cidrs.clone(),
+        memlock_limit_kb: ceiling_memlock,
+        max_pids: ceiling.max_pids.min(MAX_IT_SANDBOX_PIDS),
+        max_memory_mb: Some(ceiling.max_memory_mb),
+        cpu_affinity_mask: None,
+        require_set_ai_thread: false,
     };
+
+    let task = TaskSandboxConfig {
+        backend: Some(SandboxBackendKind::Kernel),
+        read_paths,
+        write_paths,
+        exec_paths,
+        network_mode,
+        memlock_limit_kb: Some(cfg.memlock_limit_kb),
+        max_pids: Some(cfg.max_pids),
+        max_memory_mb: Some(cfg.max_memory_mb),
+        cpu_affinity_mask: None,
+        require_set_ai_thread: Some(false),
+    };
+
+    Ok((desired_profile, task))
+}
+
+fn verify_ro_mounts_strictly_readonly(
+    validated_ro_mounts: &[PathBuf],
+    effective: &EffectiveSandboxPolicy,
+    plan: &SandboxExecutionPlan,
+) -> Result<(), AgentError> {
+    for wp in &effective.write_paths {
+        for forbidden in SENSITIVE_ETC_WRITE_PREFIXES {
+            if wp.starts_with(forbidden) {
+                return Err(AgentError::SandboxViolation(format!(
+                    "Credential directory '{}' must never be writable inside sandbox",
+                    wp.display()
+                )));
+            }
+        }
+    }
+    for mount in validated_ro_mounts {
+        if effective.write_paths.contains(mount) || effective.exec_paths.contains(mount) {
+            return Err(AgentError::SandboxViolation(format!(
+                "Read-only credential mount '{}' cannot have write or exec access",
+                mount.display()
+            )));
+        }
+        let rule = plan
+            .landlock_rules
+            .iter()
+            .find(|r| &r.path == mount)
+            .ok_or_else(|| {
+                AgentError::SandboxViolation(format!(
+                    "Read-only credential mount '{}' missing from Landlock execution plan",
+                    mount.display()
+                ))
+            })?;
+        if rule.access_mask != READ_ACCESS {
+            return Err(AgentError::SandboxViolation(format!(
+                "Read-only credential mount '{}' must have READ_ACCESS only, got mask {:#x}",
+                mount.display(),
+                rule.access_mask
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates the 3-layer `MuIsolation` security policy (`Ceiling ∩ Profile ∩ Task`) and
+/// produces a validated `KernelSandbox` execution plan capped at `max_pids <= 256`.
+pub fn build_it_sandbox_plan(
+    work_dir: &Path,
+    argv: &[OsString],
+    cfg: &ItSandboxConfig,
+) -> Result<(EffectiveSandboxPolicy, SandboxExecutionPlan), AgentError> {
+    validate_scenario_args(&cfg.extra_args)?;
+    let validated_ro_mounts = validate_ro_mounts(&cfg.ro_mounts)?;
+    validate_allowlisted_env(&cfg.allowlisted_env, &validated_ro_mounts)?;
+
+    let canon_work = fs::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
+    let sandbox_tmp = canon_work.join(".sandbox_tmp");
+    let ceiling = resolve_host_ceiling(cfg, &canon_work, work_dir, &sandbox_tmp)?;
+    let network_mode = normalize_network_mode(&cfg.network_mode);
+    let (desired_profile, task) = build_profile_and_task(
+        cfg,
+        &ceiling,
+        &canon_work,
+        work_dir,
+        &sandbox_tmp,
+        &validated_ro_mounts,
+        network_mode,
+    )?;
 
     let effective = resolve_effective_policy(&ceiling, &desired_profile, &task)
         .map_err(|e| AgentError::SandboxViolation(e.to_string()))?;
@@ -870,7 +1222,26 @@ pub fn build_it_sandbox_plan(
         .build_execution_plan(&effective, argv)
         .map_err(|e| AgentError::SandboxViolation(e.to_string()))?;
 
+    verify_ro_mounts_strictly_readonly(&validated_ro_mounts, &effective, &plan)?;
+
     Ok((effective, plan))
+}
+
+fn merge_effective_args(base: &[String], extra: &[String]) -> Result<Vec<String>, AgentError> {
+    validate_scenario_args(base)?;
+    validate_scenario_args(extra)?;
+    let mut merged = Vec::with_capacity(base.len() + extra.len());
+    for arg in base {
+        merged.push(arg.clone());
+    }
+    for arg in extra {
+        if arg.starts_with("--") && !arg.contains('=') && merged.iter().any(|a| a == arg) {
+            continue;
+        }
+        merged.push(arg.clone());
+    }
+    validate_scenario_args(&merged)?;
+    Ok(merged)
 }
 
 /// Output produced by executing a single preselected IT test inside `KernelSandbox`.
@@ -900,7 +1271,7 @@ pub trait SandboxedCommandExecutor: Send + Sync {
 
 /// Default `KernelSandbox` command executor validating the `MuIsolation` execution plan
 /// (`max_pids <= 256`, Landlock, namespace flags, seccomp-BPF, memlock cap) and running
-/// each test directly with a cleared minimal environment.
+/// each test directly with a cleared minimal environment plus explicitly allowlisted vars.
 #[derive(Debug, Default)]
 pub struct KernelSandboxedExecutor;
 
@@ -915,9 +1286,10 @@ impl SandboxedCommandExecutor for KernelSandboxedExecutor {
         slot: Slot,
         timeout: Duration,
     ) -> Result<SandboxedExecutionOutput, AgentError> {
-        let mut argv = Vec::with_capacity(1 + test.args.len());
+        let effective_args = merge_effective_args(&test.args, &sandbox_cfg.extra_args)?;
+        let mut argv = Vec::with_capacity(1 + effective_args.len());
         argv.push(test.command_path.as_os_str().to_os_string());
-        for arg in &test.args {
+        for arg in &effective_args {
             argv.push(OsString::from(arg));
         }
 
@@ -937,7 +1309,7 @@ impl SandboxedCommandExecutor for KernelSandboxedExecutor {
 
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&test.command_path);
-        cmd.args(&test.args)
+        cmd.args(&effective_args)
             .current_dir(&test.working_dir)
             .kill_on_drop(true)
             .env_clear()
@@ -949,6 +1321,9 @@ impl SandboxedCommandExecutor for KernelSandboxedExecutor {
             .env("MUCONDE_IT_SERVICE", service_name)
             .env("MUCONDE_IT_SLOT", slot.as_str())
             .env("MUCONDE_IT_WORKDIR", work_dir);
+        for (key, value) in &sandbox_cfg.allowlisted_env {
+            cmd.env(key, value);
+        }
 
         let result = tokio::time::timeout(timeout, cmd.output()).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -1418,5 +1793,418 @@ profiles:
             .await
             .unwrap_err();
         assert!(matches!(missing_err, AgentError::BundleVerification(_)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_monotonic_host_ceiling_restricted_cidrs_and_ro_mounts() {
+        use mu_ci_isolation::CLONE_NEWNET;
+
+        let dir = exec_tempdir();
+        let work_canon = fs::canonicalize(dir.path()).unwrap();
+        let argv = vec![OsString::from("/bin/true")];
+
+        let ceiling_path = dir.path().join("ceiling.yml");
+        fs::write(
+            &ceiling_path,
+            format!(
+                r#"node_id: "node-a"
+arch: "x86_64"
+allowed_backends:
+  - Kernel
+allowed_read_prefixes:
+  - /usr
+  - /bin
+  - /lib
+  - /lib64
+  - /etc/ssl
+  - /etc/hosts
+  - /etc/resolv.conf
+  - /etc/mu-cd-canary/tls
+  - /etc/mu-cd-canary/tokens
+  - {work}
+allowed_write_prefixes:
+  - /tmp
+  - {work}
+allowed_exec_prefixes:
+  - /usr/bin
+  - /bin
+  - /usr/local/bin
+  - {work}
+allowed_egress_cidrs:
+  - "127.0.0.0/8"
+  - "192.0.2.10/32"
+max_memlock_kb: 2097152
+max_cpu_cores: 4
+max_memory_mb: 4096
+max_pids: 512
+allow_spacemit_ai_thread: false
+"#,
+                work = work_canon.display()
+            ),
+        )
+        .unwrap();
+
+        let profile_path = dir.path().join("cd-canary-profile.yml");
+        fs::write(
+            &profile_path,
+            format!(
+                r#"default_profile: "cd_canary"
+profiles:
+  cd_canary:
+    backend: Kernel
+    read_paths:
+      - /usr
+      - /bin
+      - /lib
+      - /lib64
+      - /etc/ssl
+      - /etc/hosts
+      - /etc/resolv.conf
+      - /etc/mu-cd-canary/tls
+      - /etc/mu-cd-canary/tokens
+      - {work}
+    write_paths:
+      - /tmp
+      - {work}
+    exec_paths:
+      - /usr/bin
+      - /bin
+      - {work}
+    network_egress_cidrs:
+      - "127.0.0.1/32"
+      - "192.0.2.10/32"
+    memlock_limit_kb: 65536
+    max_pids: 256
+    max_memory_mb: 1024
+    require_set_ai_thread: false
+"#,
+                work = work_canon.display()
+            ),
+        )
+        .unwrap();
+
+        let ca_mount = PathBuf::from("/etc/mu-cd-canary/tls/ca.crt");
+        let tok_mount = PathBuf::from("/etc/mu-cd-canary/tokens/cd-readonly.token");
+        let valid_cfg = ItSandboxConfig {
+            host_ceiling_path: Some(ceiling_path.clone()),
+            security_file_path: Some(profile_path.clone()),
+            network_mode: NetworkEgressMode::RestrictedCidrs(vec![
+                "192.0.2.10/32".to_string(),
+                "127.0.0.1/32".to_string(),
+            ]),
+            ro_mounts: vec![ca_mount.clone(), tok_mount.clone()],
+            allowlisted_env: vec![
+                (
+                    "MU_SMOKE_TARGET_URL".to_string(),
+                    "https://node-a.example:8444".to_string(),
+                ),
+                (
+                    "MU_SMOKE_TLS_CA_FILE".to_string(),
+                    ca_mount.display().to_string(),
+                ),
+                (
+                    "MU_SMOKE_BEARER_TOKEN_FILE".to_string(),
+                    tok_mount.display().to_string(),
+                ),
+                ("MU_SMOKE_TIMEOUT_SECS".to_string(), "10".to_string()),
+                ("RUST_BACKTRACE".to_string(), "1".to_string()),
+            ],
+            extra_args: vec!["--nocapture".to_string()],
+            ..Default::default()
+        };
+
+        let (policy, plan) = build_it_sandbox_plan(dir.path(), &argv, &valid_cfg).unwrap();
+        assert_eq!(policy.max_pids, 256);
+        assert_eq!(policy.memlock_limit_kb, 65_536);
+        assert_eq!(
+            policy.network_mode,
+            NetworkEgressMode::RestrictedCidrs(vec![
+                "192.0.2.10/32".to_string(),
+                "127.0.0.1/32".to_string(),
+            ])
+        );
+        assert!(!plan.namespace_flags.unwrap().contains(CLONE_NEWNET));
+        // Credential mounts must be strictly READ_ACCESS and narrowed from directory prefixes
+        assert!(!policy
+            .read_paths
+            .contains(&PathBuf::from("/etc/mu-cd-canary/tls")));
+        assert!(!policy
+            .read_paths
+            .contains(&PathBuf::from("/etc/mu-cd-canary/tokens")));
+        for mount in [&ca_mount, &tok_mount] {
+            let rule = plan
+                .landlock_rules
+                .iter()
+                .find(|r| &r.path == mount)
+                .expect("mount present in Landlock rules");
+            assert_eq!(rule.access_mask, READ_ACCESS);
+        }
+
+        // Empty RestrictedCidrs normalizes to Offline with CLONE_NEWNET
+        let offline_cfg = ItSandboxConfig {
+            network_mode: NetworkEgressMode::RestrictedCidrs(Vec::new()),
+            ..valid_cfg.clone()
+        };
+        let (off_policy, off_plan) =
+            build_it_sandbox_plan(dir.path(), &argv, &offline_cfg).unwrap();
+        assert_eq!(off_policy.network_mode, NetworkEgressMode::Offline);
+        assert!(off_plan.namespace_flags.unwrap().contains(CLONE_NEWNET));
+
+        // Out-of-ceiling CIDRs fail closed (SecurityGrantDenied)
+        for bad_cidr in ["0.0.0.0/0", "198.51.100.1/32"] {
+            let bad = ItSandboxConfig {
+                network_mode: NetworkEgressMode::RestrictedCidrs(vec![bad_cidr.to_string()]),
+                ..valid_cfg.clone()
+            };
+            let err = build_it_sandbox_plan(dir.path(), &argv, &bad).unwrap_err();
+            assert!(matches!(err, AgentError::SandboxViolation(_)));
+        }
+
+        // Unpermitted or traversal RO mounts fail closed
+        for bad_mount in [
+            "/etc/shadow",
+            "/etc/muconde/tls/client.key",
+            "/etc/mu-cd-canary/../shadow",
+        ] {
+            let bad = ItSandboxConfig {
+                ro_mounts: vec![PathBuf::from(bad_mount)],
+                allowlisted_env: Vec::new(),
+                ..valid_cfg.clone()
+            };
+            let err = build_it_sandbox_plan(dir.path(), &argv, &bad).unwrap_err();
+            assert!(matches!(err, AgentError::SandboxViolation(_)));
+        }
+
+        // Requesting >256 PIDs fails closed even though host ceiling allows 512 for CI builds
+        let too_many_pids = ItSandboxConfig {
+            max_pids: 257,
+            ..valid_cfg.clone()
+        };
+        assert!(matches!(
+            build_it_sandbox_plan(dir.path(), &argv, &too_many_pids),
+            Err(AgentError::SandboxViolation(_))
+        ));
+
+        // Requesting memlock above profile ceiling fails closed
+        let too_much_memlock = ItSandboxConfig {
+            memlock_limit_kb: 131_072,
+            ..valid_cfg.clone()
+        };
+        assert!(matches!(
+            build_it_sandbox_plan(dir.path(), &argv, &too_much_memlock),
+            Err(AgentError::SandboxViolation(_))
+        ));
+
+        // Missing host ceiling file fails closed
+        let missing_ceiling = ItSandboxConfig {
+            host_ceiling_path: Some(dir.path().join("nonexistent-ceiling.yml")),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_it_sandbox_plan(dir.path(), &argv, &missing_ceiling),
+            Err(AgentError::SandboxViolation(_))
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_aarch64_ceiling_arch_normalization_builds_valid_seccomp_plan() {
+        assert_eq!(normalize_sandbox_arch("aarch64"), "riscv64gc");
+        assert_eq!(normalize_sandbox_arch("arm64"), "riscv64gc");
+        assert_eq!(normalize_sandbox_arch("x86_64"), "x86_64");
+
+        let dir = exec_tempdir();
+        let work_canon = fs::canonicalize(dir.path()).unwrap();
+        let ceiling_path = dir.path().join("arm64-ceiling.yml");
+        fs::write(
+            &ceiling_path,
+            format!(
+                r#"node_id: "worker-aarch64"
+arch: "aarch64"
+allowed_backends:
+  - Kernel
+allowed_read_prefixes:
+  - /usr
+  - /bin
+  - {work}
+allowed_write_prefixes:
+  - /tmp
+  - {work}
+allowed_exec_prefixes:
+  - /usr/bin
+  - /bin
+  - {work}
+allowed_egress_cidrs:
+  - "127.0.0.1/32"
+max_memlock_kb: 524288
+max_cpu_cores: 4
+max_memory_mb: 3584
+max_pids: 512
+allow_spacemit_ai_thread: false
+"#,
+                work = work_canon.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = ItSandboxConfig {
+            host_ceiling_path: Some(ceiling_path),
+            ..Default::default()
+        };
+        let argv = vec![OsString::from("/bin/true")];
+        let (policy, plan) = build_it_sandbox_plan(dir.path(), &argv, &cfg).unwrap();
+        assert_eq!(policy.arch, "riscv64gc");
+        let seccomp = plan.seccomp_plan.expect("seccomp plan present");
+        assert!(seccomp.enforce_no_new_privs);
+        assert_eq!(seccomp.target_arch, "riscv64");
+        assert_eq!(seccomp.denied_syscalls.len(), 16);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_allowlisted_env_and_args_validation_and_runtime_isolation() {
+        // 1. Disallowed env keys rejected fail-closed
+        for bad_key in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "PATH",
+            "HOME",
+            "SECRET_TOKEN",
+        ] {
+            let err = validate_allowlisted_env(&[(bad_key.to_string(), "x".to_string())], &[])
+                .unwrap_err();
+            assert!(matches!(err, AgentError::SandboxViolation(_)));
+        }
+        // 2. MU_SMOKE_*_FILE missing from ro_mounts rejected
+        let err = validate_allowlisted_env(
+            &[(
+                "MU_SMOKE_BEARER_TOKEN_FILE".to_string(),
+                "/etc/mu-cd-canary/tokens/cd-readonly.token".to_string(),
+            )],
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, AgentError::SandboxViolation(_)));
+
+        // 3. Invalid RUST_BACKTRACE, timeout, NUL bytes, and oversized args rejected
+        assert!(
+            validate_allowlisted_env(&[("RUST_BACKTRACE".into(), "full".into())], &[]).is_err()
+        );
+        assert!(
+            validate_allowlisted_env(&[("MU_SMOKE_TIMEOUT_SECS".into(), "0".into())], &[]).is_err()
+        );
+        assert!(validate_allowlisted_env(&[("RUST_LOG".into(), "info\0bad".into())], &[]).is_err());
+        let too_many_args: Vec<String> = (0..=MAX_SCENARIO_ARGS).map(|i| format!("a{i}")).collect();
+        assert!(validate_scenario_args(&too_many_args).is_err());
+        assert!(validate_scenario_args(&["x".repeat(MAX_SCENARIO_ARG_BYTES + 1)]).is_err());
+        assert!(validate_scenario_args(&["bad\0arg".to_string()]).is_err());
+
+        // 4. Real execution: env_clear drops host env, injects allowlisted env, deduplicates --nocapture
+        let (archive, digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"it_allowlist","command":"bin/check.sh","args":["--nocapture"],"critical":true}]}"#,
+                0o644,
+            ),
+            (
+                "bin/check.sh",
+                b"#!/bin/sh\necho \"args=$* url=$MU_SMOKE_TARGET_URL bt=$RUST_BACKTRACE home=${HOME:-UNSET}\"\nexit 0\n",
+                0o755,
+            ),
+        ]);
+        let work = exec_tempdir();
+        let bundle = unpack_verified_it_archive(&archive, &digest, work.path()).unwrap();
+        let ca_file = work.path().join("ca.crt");
+        fs::write(&ca_file, b"dummy-ca").unwrap();
+        let ca_canon = fs::canonicalize(&ca_file).unwrap();
+
+        let cfg = ItSandboxConfig {
+            ro_mounts: vec![ca_canon.clone()],
+            allowlisted_env: vec![
+                (
+                    "MU_SMOKE_TARGET_URL".to_string(),
+                    "http://127.0.0.1:8080/health".to_string(),
+                ),
+                (
+                    "MU_SMOKE_TLS_CA_FILE".to_string(),
+                    ca_canon.display().to_string(),
+                ),
+                ("RUST_BACKTRACE".to_string(), "1".to_string()),
+            ],
+            extra_args: vec!["--nocapture".to_string(), "smoke_filter".to_string()],
+            ..Default::default()
+        };
+
+        let out = KernelSandboxedExecutor
+            .execute_in_sandbox(
+                &bundle.tests[0],
+                work.path(),
+                &cfg,
+                "mu-cd-agent",
+                Slot::B,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(out.passed);
+        assert!(out.log_output.contains("args=--nocapture smoke_filter"));
+        assert!(out.log_output.contains("url=http://127.0.0.1:8080/health"));
+        assert!(out.log_output.contains("bt=1"));
+        assert!(out.log_output.contains("home=UNSET"));
+    }
+
+    #[test]
+    fn test_deterministic_secret_redactor_scrubs_pem_bearer_kv_pats_aws_and_truncation_boundary() {
+        let raw = concat!(
+            "pem_ec=-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIPayloadSecretECKey123456\n-----END EC PRIVATE KEY-----\n",
+            "pem_pkcs8=-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH\n-----END PRIVATE KEY-----\n",
+            "auth=Authorization: Bearer eyJcanary.secret.jwt\n",
+            "lower=bearer another-secret-bearer\n",
+            "kv token=tok_val_1 secret=sec_val_2 password=pw_val_3 api_key=ak_val_4 apikey=ak_val_5 client_secret=cs_val_6 webhook_secret=ws_val_7\n",
+            "gh ghp_111111aaaa gho_222222bbbb ghs_333333cccc ghu_444444dddd ghr_555555eeee github_pat_666666_ffff\n",
+            "aws AKIAIOSFODNN7EXAMPLE ASIAIOSFODNN7TEMPKEY\n",
+        );
+        let scrubbed = sanitize_and_bound_log_excerpt(raw, MAX_LOG_EXCERPT_BYTES);
+        for leaked in [
+            "MHcCAQEEIPayloadSecretECKey123456",
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH",
+            "eyJcanary.secret.jwt",
+            "another-secret-bearer",
+            "tok_val_1",
+            "sec_val_2",
+            "pw_val_3",
+            "ak_val_4",
+            "ak_val_5",
+            "cs_val_6",
+            "ws_val_7",
+            "ghp_111111aaaa",
+            "gho_222222bbbb",
+            "ghs_333333cccc",
+            "ghu_444444dddd",
+            "ghr_555555eeee",
+            "github_pat_666666_ffff",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ASIAIOSFODNN7TEMPKEY",
+        ] {
+            assert!(
+                !scrubbed.contains(leaked),
+                "secret '{leaked}' must be redacted from excerpt: {scrubbed}"
+            );
+        }
+        assert!(scrubbed.contains(REDACTED_PLACEHOLDER));
+
+        // Secret straddling the 8192-byte truncation boundary must be redacted BEFORE truncation
+        #[cfg(miri)]
+        let max_bound = 256usize;
+        #[cfg(not(miri))]
+        let max_bound = MAX_LOG_EXCERPT_BYTES;
+        let pad = "a".repeat(max_bound.saturating_sub(24));
+        let boundary_input = format!("{pad} Authorization: Bearer boundary-secret-token-999999999");
+        let bounded = sanitize_and_bound_log_excerpt(&boundary_input, max_bound);
+        assert!(bounded.len() <= max_bound);
+        assert!(!bounded.contains("boundary-secret-token"));
+        assert!(!bounded.contains("boundary-sec"));
+        assert!(bounded.ends_with("...[truncated]"));
     }
 }

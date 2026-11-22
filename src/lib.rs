@@ -28,12 +28,15 @@ pub use manifest::{
     AbRulesConfig, DeploymentConfig, MuCdManifest, RawIntegrationTestsField, DEFAULT_KEEP_SNAPSHOTS,
 };
 pub use sandbox_it::{
-    build_it_sandbox_plan, canonical_sandbox_arch, resolve_gate_plan, resolve_gate_plan_with_base,
-    sanitize_and_bound_log_excerpt, unpack_verified_it_archive, validate_sha256_digest,
+    build_it_sandbox_plan, canonical_sandbox_arch, normalize_sandbox_arch, resolve_gate_plan,
+    resolve_gate_plan_with_base, sanitize_and_bound_log_excerpt, unpack_verified_it_archive,
+    validate_allowlisted_env, validate_ro_mounts, validate_scenario_args, validate_sha256_digest,
     verify_sha256_bytes, DiscoveredItTest, ItArchiveFetcher, ItArchiveManifest, ItManifestEntry,
     ItSandboxConfig, KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor,
-    SandboxedExecutionOutput, UnpackedItBundle, DEFAULT_IT_MEMLOCK_KB,
+    SandboxedExecutionOutput, UnpackedItBundle, ALLOWED_SCENARIO_ENV_KEYS,
+    DEFAULT_CANARY_PROFILE_PATH, DEFAULT_HOST_CEILING_PATH, DEFAULT_IT_MEMLOCK_KB,
     MAX_IT_ARCHIVE_UNCOMPRESSED_BYTES, MAX_IT_SANDBOX_PIDS, MAX_LOG_EXCERPT_BYTES,
+    MAX_SCENARIO_ARGS, MAX_SCENARIO_ARG_BYTES,
 };
 pub use slot::{
     default_cd_root, is_production_cd_root, Slot, SlotManager, SwapReceipt, LEGACY_CD_ROOT,

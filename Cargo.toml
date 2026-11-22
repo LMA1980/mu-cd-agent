@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/mu-cd-agent"
 
 [dependencies]
-mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "main" }
+mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "feat/scenario-execution-plan-v03" }
 mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
 mu-ci-isolation = { git = "https://github.com/LMA1980/mu-ci-isolation.git", branch = "main" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }

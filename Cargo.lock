@@ -1235,8 +1235,8 @@ dependencies = [
 
 [[package]]
 name = "mu-cd-ipc"
-version = "0.2.1"
-source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=main#e9924172a6284b056196a93853826e9a4a78b9b6"
+version = "0.3.0"
+source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=feat%2Fscenario-execution-plan-v03#e1300a101bf21abfba05bb51cb081ba0746ee934"
 dependencies = [
  "bytes",
  "fory",

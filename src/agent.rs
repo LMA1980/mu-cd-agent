@@ -12,12 +12,15 @@ use std::time::{Duration, Instant};
 use mu_cd_ipc::framing::{
     read_frame, write_frame, IpcHeader, MSG_TYPE_ARTIFACT_TAINT, MSG_TYPE_HEALTH_PROBE,
     MSG_TYPE_HEARTBEAT, MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK,
-    MSG_TYPE_SLOT_SWAP, MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
+    MSG_TYPE_SCENARIO_PLAN, MSG_TYPE_SCENARIO_PLAN_ACK, MSG_TYPE_SLOT_SWAP,
+    MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
 use mu_cd_ipc::{
     create_fory_runtime, ArtifactTaintNotification, HeartbeatTelemetry, IntegrationTestProgress,
-    IntegrationTestReport, RollbackCommand, SlotSwapCommand, StageDeploymentRequest, TestState,
+    IntegrationTestReport, RollbackCommand, ScenarioEnvVar, ScenarioExecutionPlan, ScenarioPlanAck,
+    ScenarioTestSpec, SlotSwapCommand, StageDeploymentRequest, TestState,
 };
+use mu_ci_isolation::{NetworkEgressMode, MAX_K3_MEMLOCK_KB};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -33,10 +36,11 @@ use crate::gate::{
 };
 use crate::manifest::{AbRulesConfig, DeploymentConfig, MuCdManifest};
 use crate::sandbox_it::{
-    resolve_gate_plan_with_base, sanitize_and_bound_log_excerpt, unpack_verified_it_archive,
-    validate_sha256_digest, DiscoveredItTest, ItArchiveFetcher, ItSandboxConfig,
-    KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor,
-    MAX_LOG_EXCERPT_BYTES,
+    build_it_sandbox_plan, resolve_gate_plan_with_base, sanitize_and_bound_log_excerpt,
+    unpack_verified_it_archive, validate_allowlisted_env, validate_ro_mounts,
+    validate_scenario_args, validate_sha256_digest, DiscoveredItTest, ItArchiveFetcher,
+    ItSandboxConfig, KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor,
+    UnpackedItBundle, MAX_IT_SANDBOX_PIDS, MAX_LOG_EXCERPT_BYTES,
 };
 use crate::slot::{default_cd_root, is_production_cd_root, Slot, SlotManager};
 use crate::telemetry::{
@@ -251,6 +255,342 @@ async fn write_taint_frame<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn write_scenario_plan_ack_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    fory: &fory::Fory,
+    ack: &ScenarioPlanAck,
+    sequence: u64,
+) -> Result<(), AgentError> {
+    let ack_bytes = fory
+        .serialize(ack)
+        .map_err(|e| AgentError::Serialization(e.to_string()))?;
+    let ack_header = IpcHeader::new(
+        MSG_TYPE_SCENARIO_PLAN_ACK,
+        ack_bytes.len() as u32,
+        0,
+        sequence,
+    );
+    write_frame(stream, &ack_header, &ack_bytes).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum StoredScenarioPlan {
+    Accepted(Box<ScenarioExecutionPlan>),
+    Rejected(String),
+}
+
+#[derive(Debug, Clone)]
+struct PlannedSandboxedTest {
+    test: DiscoveredItTest,
+    sandbox_cfg: ItSandboxConfig,
+}
+
+fn merge_scenario_env(
+    plan_env: &[ScenarioEnvVar],
+    spec_env: &[ScenarioEnvVar],
+) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = Vec::with_capacity(plan_env.len() + spec_env.len());
+    for entry in plan_env.iter().chain(spec_env.iter()) {
+        if let Some(existing) = merged.iter_mut().find(|(k, _)| k == &entry.key) {
+            existing.1 = entry.value.clone();
+        } else {
+            merged.push((entry.key.clone(), entry.value.clone()));
+        }
+    }
+    merged
+}
+
+fn merge_scenario_mounts(plan_mounts: &[String], spec_mounts: &[String]) -> Vec<PathBuf> {
+    let mut merged = Vec::with_capacity(plan_mounts.len() + spec_mounts.len());
+    for raw in plan_mounts.iter().chain(spec_mounts.iter()) {
+        let p = PathBuf::from(raw);
+        if !merged.contains(&p) {
+            merged.push(p);
+        }
+    }
+    merged
+}
+
+fn merge_scenario_args(plan_args: &[String], spec_args: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(plan_args.len() + spec_args.len());
+    for arg in plan_args {
+        merged.push(arg.clone());
+    }
+    for arg in spec_args {
+        if arg.starts_with("--") && !arg.contains('=') && merged.iter().any(|a| a == arg) {
+            continue;
+        }
+        merged.push(arg.clone());
+    }
+    merged
+}
+
+fn validate_scenario_execution_plan(plan: &ScenarioExecutionPlan) -> Result<(), AgentError> {
+    if plan.deployment_id.trim().is_empty() {
+        return Err(AgentError::Config(
+            "ScenarioExecutionPlan deployment_id must not be empty".to_string(),
+        ));
+    }
+    if plan.service_name.trim().is_empty() {
+        return Err(AgentError::Config(
+            "ScenarioExecutionPlan service_name must not be empty".to_string(),
+        ));
+    }
+    if plan.selected_tests.is_empty() && plan.scenarios.is_empty() {
+        return Err(AgentError::UnknownIntegrationTests(vec![
+            "<empty_scenario_plan>".to_string(),
+        ]));
+    }
+    if plan.max_pids > MAX_IT_SANDBOX_PIDS {
+        return Err(AgentError::SandboxViolation(format!(
+            "ScenarioExecutionPlan max_pids {} exceeds maximum of {MAX_IT_SANDBOX_PIDS}",
+            plan.max_pids
+        )));
+    }
+    if plan.max_memlock_kb > MAX_K3_MEMLOCK_KB {
+        return Err(AgentError::SandboxViolation(format!(
+            "ScenarioExecutionPlan max_memlock_kb {} exceeds bounded ceiling {MAX_K3_MEMLOCK_KB}",
+            plan.max_memlock_kb
+        )));
+    }
+    if let Some(ref digest) = plan.it_archive_digest {
+        validate_sha256_digest(digest)?;
+    }
+
+    validate_scenario_args(&plan.args)?;
+    let plan_mounts: Vec<PathBuf> = plan.ro_mounts.iter().map(PathBuf::from).collect();
+    let validated_plan_mounts = validate_ro_mounts(&plan_mounts)?;
+    let plan_env: Vec<(String, String)> = plan
+        .env
+        .iter()
+        .map(|e| (e.key.clone(), e.value.clone()))
+        .collect();
+    validate_allowlisted_env(&plan_env, &validated_plan_mounts)?;
+
+    for spec in &plan.scenarios {
+        if spec.name.trim().is_empty() {
+            return Err(AgentError::Config(
+                "ScenarioTestSpec name must not be empty".to_string(),
+            ));
+        }
+        if spec.test_binary.trim().is_empty() {
+            return Err(AgentError::Config(format!(
+                "ScenarioTestSpec '{}' test_binary must not be empty",
+                spec.name
+            )));
+        }
+        if spec.timeout_secs == 0 {
+            return Err(AgentError::Config(format!(
+                "ScenarioTestSpec '{}' timeout_secs must be greater than 0",
+                spec.name
+            )));
+        }
+        let merged_args = merge_scenario_args(&plan.args, &spec.args);
+        validate_scenario_args(&merged_args)?;
+        let merged_mounts = merge_scenario_mounts(&plan.ro_mounts, &spec.ro_mounts);
+        let validated_mounts = validate_ro_mounts(&merged_mounts)?;
+        let merged_env = merge_scenario_env(&plan.env, &spec.env);
+        validate_allowlisted_env(&merged_env, &validated_mounts)?;
+    }
+
+    Ok(())
+}
+
+fn find_bundle_test<'a>(
+    bundle: Option<&'a UnpackedItBundle>,
+    name: &str,
+) -> Option<&'a DiscoveredItTest> {
+    let bundle = bundle?;
+    bundle.tests.iter().find(|t| {
+        t.name == name
+            || t.command_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == name)
+    })
+}
+
+fn build_scenario_sandbox_config(
+    base: &ItSandboxConfig,
+    plan: &ScenarioExecutionPlan,
+    spec: Option<&ScenarioTestSpec>,
+) -> ItSandboxConfig {
+    let cidrs = match spec {
+        Some(s) if !s.cidrs.is_empty() => s.cidrs.clone(),
+        _ => plan.cidrs.clone(),
+    };
+    let network_mode = if cidrs.is_empty() {
+        NetworkEgressMode::Offline
+    } else {
+        NetworkEgressMode::RestrictedCidrs(cidrs)
+    };
+    let ro_mounts = match spec {
+        Some(s) => merge_scenario_mounts(&plan.ro_mounts, &s.ro_mounts),
+        None => plan.ro_mounts.iter().map(PathBuf::from).collect(),
+    };
+    let allowlisted_env = match spec {
+        Some(s) => merge_scenario_env(&plan.env, &s.env),
+        None => plan
+            .env
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect(),
+    };
+    let extra_args = match spec {
+        Some(s) => merge_scenario_args(&plan.args, &s.args),
+        None => plan.args.clone(),
+    };
+    ItSandboxConfig {
+        max_pids: if plan.max_pids > 0 {
+            plan.max_pids
+        } else {
+            base.max_pids
+        },
+        memlock_limit_kb: if plan.max_memlock_kb > 0 {
+            plan.max_memlock_kb
+        } else {
+            base.memlock_limit_kb
+        },
+        network_mode,
+        ro_mounts,
+        allowlisted_env,
+        extra_args,
+        ..base.clone()
+    }
+}
+
+fn prevalidate_planned_test(planned: &PlannedSandboxedTest) -> Result<(), AgentError> {
+    let merged_args = merge_scenario_args(&planned.test.args, &planned.sandbox_cfg.extra_args);
+    let mut argv = Vec::with_capacity(1 + merged_args.len());
+    argv.push(planned.test.command_path.as_os_str().to_os_string());
+    for arg in &merged_args {
+        argv.push(std::ffi::OsString::from(arg));
+    }
+    let _ = build_it_sandbox_plan(&planned.test.working_dir, &argv, &planned.sandbox_cfg)?;
+    Ok(())
+}
+
+fn resolve_scenario_execution_plan(
+    base_catalog: &[GateTest],
+    base_sandbox: &ItSandboxConfig,
+    plan: &ScenarioExecutionPlan,
+    unpacked_bundle: Option<&UnpackedItBundle>,
+) -> Result<(Vec<GateTest>, Vec<PlannedSandboxedTest>), AgentError> {
+    let mut missing = Vec::new();
+    let mut push_missing = |name: &str| {
+        if !missing.iter().any(|m: &String| m == name) {
+            missing.push(name.to_string());
+        }
+    };
+
+    let select_all = plan
+        .selected_tests
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("all"));
+
+    for spec in &plan.scenarios {
+        if find_bundle_test(unpacked_bundle, &spec.test_binary).is_none()
+            && find_bundle_test(unpacked_bundle, &spec.name).is_none()
+        {
+            push_missing(&spec.test_binary);
+        }
+    }
+
+    for req in &plan.selected_tests {
+        if req.eq_ignore_ascii_case("all") {
+            continue;
+        }
+        if base_catalog.iter().any(|b| b.name == *req) {
+            continue;
+        }
+        if plan
+            .scenarios
+            .iter()
+            .any(|s| s.name == *req || s.test_binary == *req)
+        {
+            continue;
+        }
+        if find_bundle_test(unpacked_bundle, req).is_none() {
+            push_missing(req);
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(AgentError::UnknownIntegrationTests(missing));
+    }
+
+    let mut gate_tests = Vec::new();
+    let mut planned_custom = Vec::new();
+
+    for builtin in base_catalog {
+        if select_all || plan.selected_tests.iter().any(|n| n == &builtin.name) {
+            gate_tests.push(builtin.clone());
+        }
+    }
+
+    for spec in &plan.scenarios {
+        let base_test = find_bundle_test(unpacked_bundle, &spec.test_binary)
+            .or_else(|| find_bundle_test(unpacked_bundle, &spec.name))
+            .ok_or_else(|| AgentError::UnknownIntegrationTests(vec![spec.test_binary.clone()]))?;
+        let test = DiscoveredItTest {
+            name: spec.name.clone(),
+            command_path: base_test.command_path.clone(),
+            args: base_test.args.clone(),
+            critical: spec.critical,
+            timeout_secs: Some(spec.timeout_secs),
+            working_dir: base_test.working_dir.clone(),
+        };
+        let sandbox_cfg = build_scenario_sandbox_config(base_sandbox, plan, Some(spec));
+        let planned = PlannedSandboxedTest { test, sandbox_cfg };
+        prevalidate_planned_test(&planned)?;
+        gate_tests.push(planned.test.as_gate_test());
+        planned_custom.push(planned);
+    }
+
+    for req in &plan.selected_tests {
+        if req.eq_ignore_ascii_case("all")
+            || base_catalog.iter().any(|b| b.name == *req)
+            || plan
+                .scenarios
+                .iter()
+                .any(|s| s.name == *req || s.test_binary == *req)
+        {
+            continue;
+        }
+        let base_test = find_bundle_test(unpacked_bundle, req)
+            .ok_or_else(|| AgentError::UnknownIntegrationTests(vec![req.clone()]))?;
+        let sandbox_cfg = build_scenario_sandbox_config(base_sandbox, plan, None);
+        let planned = PlannedSandboxedTest {
+            test: base_test.clone(),
+            sandbox_cfg,
+        };
+        prevalidate_planned_test(&planned)?;
+        gate_tests.push(planned.test.as_gate_test());
+        planned_custom.push(planned);
+    }
+
+    if select_all && plan.scenarios.is_empty() {
+        if let Some(bundle) = unpacked_bundle {
+            for base_test in &bundle.tests {
+                if gate_tests.iter().any(|g| g.name == base_test.name) {
+                    continue;
+                }
+                let sandbox_cfg = build_scenario_sandbox_config(base_sandbox, plan, None);
+                let planned = PlannedSandboxedTest {
+                    test: base_test.clone(),
+                    sandbox_cfg,
+                };
+                prevalidate_planned_test(&planned)?;
+                gate_tests.push(planned.test.as_gate_test());
+                planned_custom.push(planned);
+            }
+        }
+    }
+
+    Ok((gate_tests, planned_custom))
+}
+
 /// Continuous delivery node agent running as a resident systemd daemon.
 pub struct MuConDeAgent {
     config: MuConDeAgentConfig,
@@ -262,6 +602,7 @@ pub struct MuConDeAgent {
     it_executor: Arc<dyn SandboxedCommandExecutor>,
     staged_digests: Arc<Mutex<HashMap<String, String>>>,
     swap_units: Arc<Mutex<HashMap<String, String>>>,
+    scenario_plans: Arc<Mutex<HashMap<String, StoredScenarioPlan>>>,
 }
 
 struct ServiceContract {
@@ -328,6 +669,7 @@ impl MuConDeAgent {
             it_executor,
             staged_digests: Arc::new(Mutex::new(HashMap::new())),
             swap_units: Arc::new(Mutex::new(HashMap::new())),
+            scenario_plans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -398,6 +740,7 @@ impl MuConDeAgent {
             it_executor: self.it_executor.clone(),
             staged_digests: self.staged_digests.clone(),
             swap_units: self.swap_units.clone(),
+            scenario_plans: self.scenario_plans.clone(),
         }
     }
 
@@ -627,6 +970,64 @@ impl MuConDeAgent {
                     write_frame(&mut stream, &resp_header, &resp_bytes).await?;
                 }
 
+                MSG_TYPE_SCENARIO_PLAN => {
+                    let plan: ScenarioExecutionPlan = fory
+                        .deserialize(&payload)
+                        .map_err(|e| AgentError::Serialization(e.to_string()))?;
+
+                    let ack = match validate_scenario_execution_plan(&plan) {
+                        Ok(()) => {
+                            tracing::info!(
+                                deployment_id = %plan.deployment_id,
+                                service = %plan.service_name,
+                                policy_commit = %plan.policy_commit_sha,
+                                selected_tests = plan.selected_tests.len(),
+                                scenarios = plan.scenarios.len(),
+                                "Stored validated ScenarioExecutionPlan"
+                            );
+                            let deployment_id = plan.deployment_id.clone();
+                            let lease_id = plan.lease_id.clone();
+                            self.scenario_plans.lock().await.insert(
+                                deployment_id.clone(),
+                                StoredScenarioPlan::Accepted(Box::new(plan)),
+                            );
+                            ScenarioPlanAck {
+                                deployment_id,
+                                lease_id,
+                                accepted: true,
+                                rejection_reason: None,
+                            }
+                        }
+                        Err(err) => {
+                            let safe_reason = sanitize_and_bound_log_excerpt(
+                                &err.to_string(),
+                                MAX_LOG_EXCERPT_BYTES,
+                            );
+                            tracing::warn!(
+                                deployment_id = %plan.deployment_id,
+                                service = %plan.service_name,
+                                reason = %safe_reason,
+                                "Rejected invalid ScenarioExecutionPlan (will fail closed on slot swap)"
+                            );
+                            if !plan.deployment_id.trim().is_empty() {
+                                self.scenario_plans.lock().await.insert(
+                                    plan.deployment_id.clone(),
+                                    StoredScenarioPlan::Rejected(safe_reason.clone()),
+                                );
+                            }
+                            ScenarioPlanAck {
+                                deployment_id: plan.deployment_id,
+                                lease_id: plan.lease_id,
+                                accepted: false,
+                                rejection_reason: Some(safe_reason),
+                            }
+                        }
+                    };
+                    let _ =
+                        write_scenario_plan_ack_frame(&mut stream, &fory, &ack, header.sequence)
+                            .await;
+                }
+
                 MSG_TYPE_SLOT_SWAP => {
                     let cmd: SlotSwapCommand = fory
                         .deserialize(&payload)
@@ -844,31 +1245,84 @@ impl MuConDeAgent {
     ) -> Result<
         (
             Vec<GateTest>,
-            Vec<DiscoveredItTest>,
+            Vec<PlannedSandboxedTest>,
             Option<EphemeralUnpackDir>,
             AbRulesConfig,
         ),
         AgentError,
     > {
         let contract = self.resolve_service_contract(&cmd.service_name, Some(target_slot))?;
+        let stored_plan = self.scenario_plans.lock().await.remove(&cmd.deployment_id);
 
-        let mut unpack_guard = None;
-        let mut unpacked_bundle = None;
-        if let Some(ref digest) = contract.it_archive_digest {
-            let dir_guard =
-                EphemeralUnpackDir::create(&self.config.muconde_root, &cmd.deployment_id)?;
-            let archive_bytes = self.it_fetcher.fetch_it_archive(digest).await?;
-            let bundle = unpack_verified_it_archive(&archive_bytes, digest, dir_guard.path())?;
-            unpacked_bundle = Some(bundle);
-            unpack_guard = Some(dir_guard);
+        match stored_plan {
+            Some(StoredScenarioPlan::Rejected(reason)) => Err(AgentError::SandboxViolation(reason)),
+            Some(StoredScenarioPlan::Accepted(plan)) => {
+                if plan.service_name != cmd.service_name {
+                    return Err(AgentError::Config(format!(
+                        "ScenarioExecutionPlan service '{}' does not match SlotSwapCommand service '{}'",
+                        plan.service_name, cmd.service_name
+                    )));
+                }
+                if !plan.lease_id.is_empty() && plan.lease_id != cmd.lease_id {
+                    return Err(AgentError::Config(format!(
+                        "ScenarioExecutionPlan lease '{}' does not match SlotSwapCommand lease '{}'",
+                        plan.lease_id, cmd.lease_id
+                    )));
+                }
+
+                let mut unpack_guard = None;
+                let mut unpacked_bundle = None;
+                if let Some(ref digest) = plan.it_archive_digest {
+                    let dir_guard =
+                        EphemeralUnpackDir::create(&self.config.muconde_root, &cmd.deployment_id)?;
+                    let archive_bytes = self
+                        .it_fetcher
+                        .fetch_it_archive_for_bundle(digest, plan.bundle_id.as_deref())
+                        .await?;
+                    let bundle =
+                        unpack_verified_it_archive(&archive_bytes, digest, dir_guard.path())?;
+                    unpacked_bundle = Some(bundle);
+                    unpack_guard = Some(dir_guard);
+                }
+
+                let (gate_tests, planned_tests) = resolve_scenario_execution_plan(
+                    &self.config.gate_catalog,
+                    &self.config.it_sandbox,
+                    &plan,
+                    unpacked_bundle.as_ref(),
+                )?;
+                let mut ab_rules = contract.ab_rules;
+                ab_rules.auto_rollback_on_critical = plan.auto_rollback_on_critical;
+                Ok((gate_tests, planned_tests, unpack_guard, ab_rules))
+            }
+            None => {
+                let mut unpack_guard = None;
+                let mut unpacked_bundle = None;
+                if let Some(ref digest) = contract.it_archive_digest {
+                    let dir_guard =
+                        EphemeralUnpackDir::create(&self.config.muconde_root, &cmd.deployment_id)?;
+                    let archive_bytes = self.it_fetcher.fetch_it_archive(digest).await?;
+                    let bundle =
+                        unpack_verified_it_archive(&archive_bytes, digest, dir_guard.path())?;
+                    unpacked_bundle = Some(bundle);
+                    unpack_guard = Some(dir_guard);
+                }
+
+                let (gate_tests, custom_tests) = resolve_gate_plan_with_base(
+                    &self.config.gate_catalog,
+                    &contract.selection,
+                    unpacked_bundle.as_ref(),
+                )?;
+                let planned_tests: Vec<PlannedSandboxedTest> = custom_tests
+                    .into_iter()
+                    .map(|test| PlannedSandboxedTest {
+                        test,
+                        sandbox_cfg: self.config.it_sandbox.clone(),
+                    })
+                    .collect();
+                Ok((gate_tests, planned_tests, unpack_guard, contract.ab_rules))
+            }
         }
-
-        let (gate_tests, custom_tests) = resolve_gate_plan_with_base(
-            &self.config.gate_catalog,
-            &contract.selection,
-            unpacked_bundle.as_ref(),
-        )?;
-        Ok((gate_tests, custom_tests, unpack_guard, contract.ab_rules))
     }
 
     async fn execute_slot_swap_and_gate<S: AsyncWrite + Unpin>(
@@ -996,7 +1450,7 @@ impl MuConDeAgent {
         let mut gate = GateTracker::new(&cmd.deployment_id, gate_tests);
         send_it_progress(stream, fory, &gate.pending_updates(), sequence).await;
 
-        let custom_names: Vec<String> = custom_tests.iter().map(|t| t.name.clone()).collect();
+        let custom_names: Vec<String> = custom_tests.iter().map(|t| t.test.name.clone()).collect();
         let mut warmup_running = Vec::new();
         for name in gate.names() {
             if !custom_names.contains(&name) {
@@ -1096,9 +1550,10 @@ impl MuConDeAgent {
         match outcome_task.await {
             Ok(Ok(WatchdogOutcome::RolledBack {
                 mut report,
-                taint,
+                mut taint,
                 elapsed_rollback_ms,
             })) => {
+                taint.reason = sanitize_and_bound_log_excerpt(&taint.reason, MAX_LOG_EXCERPT_BYTES);
                 self.emit_rollback_span(
                     &cmd,
                     restore_slot,
@@ -1186,9 +1641,11 @@ impl MuConDeAgent {
         gate_err: AgentError,
         rollback_deployment: Option<&DeploymentConfig>,
     ) -> Result<(), AgentError> {
-        let reason = gate_err.to_string();
+        let safe_reason =
+            sanitize_and_bound_log_excerpt(&gate_err.to_string(), MAX_LOG_EXCERPT_BYTES);
         let failed_tests = match &gate_err {
             AgentError::UnknownIntegrationTests(missing) if !missing.is_empty() => missing.clone(),
+            AgentError::SandboxViolation(_) => vec!["sandbox_policy_enforcement".to_string()],
             _ => vec!["it_bundle_verification".to_string()],
         };
         let gate_tests: Vec<GateTest> = failed_tests
@@ -1207,7 +1664,7 @@ impl MuConDeAgent {
                 &cmd.service_name,
                 restore_slot,
                 candidate_sha256,
-                &reason,
+                &safe_reason,
                 rollback_deployment,
                 Some(cmd.systemd_unit.as_str()),
             )?;
@@ -1223,10 +1680,7 @@ impl MuConDeAgent {
 
         report.executed_tests = failed_tests.clone();
         report.failed_tests = failed_tests;
-        report.log_excerpt = Some(sanitize_and_bound_log_excerpt(
-            &reason,
-            MAX_LOG_EXCERPT_BYTES,
-        ));
+        report.log_excerpt = Some(safe_reason);
         write_it_report_frame(stream, fory, &report, sequence).await?;
         write_taint_frame(stream, fory, &taint, sequence).await?;
         Ok(())
@@ -1245,28 +1699,29 @@ impl MuConDeAgent {
         swap_trace_ctx: &mu_observable_ipc::TraceContext,
         swap_end_ns: i64,
         gate: &mut GateTracker,
-        custom_tests: &[DiscoveredItTest],
+        custom_tests: &[PlannedSandboxedTest],
         ab_rules: &AbRulesConfig,
         rollback_deployment: Option<&DeploymentConfig>,
     ) -> Result<(), AgentError> {
         let suite_start = Instant::now();
         let mut aggregated_logs = String::new();
 
-        for test in custom_tests {
+        for planned in custom_tests {
+            let test = &planned.test;
             if let Some(running) = gate.start_test(&test.name) {
                 send_it_progress(stream, fory, &[running], sequence).await;
             }
 
             let timeout = Duration::from_secs(
                 test.timeout_secs
-                    .unwrap_or(self.config.it_sandbox.per_test_timeout_secs),
+                    .unwrap_or(planned.sandbox_cfg.per_test_timeout_secs),
             );
             let exec_res = self
                 .it_executor
                 .execute_in_sandbox(
                     test,
                     &test.working_dir,
-                    &self.config.it_sandbox,
+                    &planned.sandbox_cfg,
                     &cmd.service_name,
                     target_slot,
                     timeout,
@@ -1275,7 +1730,13 @@ impl MuConDeAgent {
 
             let (passed, detail_log) = match exec_res {
                 Ok(out) => (out.passed, out.log_output),
-                Err(err) => (false, format!("Sandbox execution failed: {err}")),
+                Err(err) => (
+                    false,
+                    sanitize_and_bound_log_excerpt(
+                        &format!("Sandbox execution failed: {err}"),
+                        MAX_LOG_EXCERPT_BYTES,
+                    ),
+                ),
             };
 
             if !detail_log.is_empty() {
@@ -1290,7 +1751,10 @@ impl MuConDeAgent {
                 let remaining_failed = gate.finish_remaining(|_| false);
                 send_it_progress(stream, fory, &remaining_failed, sequence).await;
 
-                let reason = format!("Critical sandboxed integration test '{}' failed", test.name);
+                let reason = sanitize_and_bound_log_excerpt(
+                    &format!("Critical sandboxed integration test '{}' failed", test.name),
+                    MAX_LOG_EXCERPT_BYTES,
+                );
                 let (mut report, taint, elapsed_rollback_ms) =
                     self.watchdog_monitor.execute_rollback_with_deployment(
                         &cmd.deployment_id,
@@ -2714,6 +3178,638 @@ mod tests {
         assert!(
             web_restarts.is_empty(),
             "Static web rollback must suppress systemctl restart"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_scenario_plan_ipc_enforces_env_cidrs_ro_mounts_and_emits_ack() {
+        use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
+        use mu_cd_ipc::TestState;
+        use sha2::{Digest, Sha256};
+
+        let temp = exec_tempdir();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        let cred_dir = temp.path().join("canary-creds");
+        fs::create_dir_all(&cred_dir).unwrap();
+        let ca_path = cred_dir.join("ca.crt");
+        let tok_path = cred_dir.join("cd-readonly.token");
+        fs::write(&ca_path, b"dummy-ca-pem").unwrap();
+        fs::write(&tok_path, b"readonly-canary-token").unwrap();
+        let ca_canon = fs::canonicalize(&ca_path).unwrap();
+        let tok_canon = fs::canonicalize(&tok_path).unwrap();
+        let root_canon = {
+            fs::create_dir_all(&root).unwrap();
+            fs::canonicalize(&root).unwrap()
+        };
+        let cred_canon = fs::canonicalize(&cred_dir).unwrap();
+
+        let ceiling_path = temp.path().join("ceiling.yml");
+        fs::write(
+            &ceiling_path,
+            format!(
+                r#"node_id: "node-a"
+arch: "x86_64"
+allowed_backends:
+  - Kernel
+allowed_read_prefixes:
+  - /usr
+  - /bin
+  - /lib
+  - /lib64
+  - /etc/ssl
+  - /etc/hosts
+  - /etc/resolv.conf
+  - {cred}
+  - {root}
+allowed_write_prefixes:
+  - /tmp
+  - {root}
+allowed_exec_prefixes:
+  - /usr/bin
+  - /bin
+  - /usr/local/bin
+  - {root}
+allowed_egress_cidrs:
+  - "127.0.0.1/32"
+  - "192.0.2.10/32"
+max_memlock_kb: 2097152
+max_cpu_cores: 4
+max_memory_mb: 4096
+max_pids: 512
+allow_spacemit_ai_thread: false
+"#,
+                cred = cred_canon.display(),
+                root = root_canon.display(),
+            ),
+        )
+        .unwrap();
+
+        let service = "mu-cd-agent";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+
+        let (archive, it_digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"smoke_mu_cd_agent","command":"bin/smoke_mu_cd_agent","args":["--nocapture"],"critical":true,"timeout_secs":10}]}"#.as_slice(),
+                0o644,
+            ),
+            (
+                "bin/smoke_mu_cd_agent",
+                b"#!/bin/sh\necho \"target=$MU_SMOKE_TARGET_URL ca=$MU_SMOKE_TLS_CA_FILE args=$*\"\nexit 0\n".as_slice(),
+                0o755,
+            ),
+        ]);
+        write_cas_blob(&cas_dir, &it_digest, &archive);
+
+        let candidate_bytes = b"#!/bin/sh\necho candidate-v3\n";
+        let candidate_sha = hex::encode(Sha256::digest(candidate_bytes));
+        write_cas_blob(&cas_dir, &candidate_sha, candidate_bytes);
+
+        let mut config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root,
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        config.it_sandbox.host_ceiling_path = Some(ceiling_path);
+
+        let agent = Arc::new(MuConDeAgent::new(
+            config,
+            Arc::new(MockCommandRunner::new(true)),
+            Arc::new(MockHealthProber::new(true)),
+        ));
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+
+        // Send 0x0D ScenarioExecutionPlan immediately followed by 0x06 SlotSwapCommand (non-blocking)
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-plan-ok".into(),
+            lease_id: "lease-plan-ok".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            it_archive_digest: Some(it_digest),
+            bundle_id: Some("bundle-99".into()),
+            selected_tests: vec![
+                "systemd_unit_active".into(),
+                "health_endpoint_ready".into(),
+                "smoke_mu_cd_agent".into(),
+            ],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_mu_cd_agent_node_a".into(),
+                test_binary: "smoke_mu_cd_agent".into(),
+                args: vec!["--nocapture".into()],
+                env: vec![
+                    ScenarioEnvVar {
+                        key: "MU_SMOKE_TARGET_URL".into(),
+                        value: "https://node-a.example:8446".into(),
+                    },
+                    ScenarioEnvVar {
+                        key: "MU_SMOKE_TLS_CA_FILE".into(),
+                        value: ca_canon.display().to_string(),
+                    },
+                    ScenarioEnvVar {
+                        key: "MU_SMOKE_BEARER_TOKEN_FILE".into(),
+                        value: tok_canon.display().to_string(),
+                    },
+                    ScenarioEnvVar {
+                        key: "MU_SMOKE_TIMEOUT_SECS".into(),
+                        value: "10".into(),
+                    },
+                ],
+                cidrs: vec!["192.0.2.10/32".into(), "127.0.0.1/32".into()],
+                ro_mounts: vec![
+                    ca_canon.display().to_string(),
+                    tok_canon.display().to_string(),
+                ],
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let plan_bytes = fory.serialize(&plan).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 50),
+            &plan_bytes,
+        )
+        .await
+        .unwrap();
+
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-plan-ok".into(),
+            lease_id: "lease-plan-ok".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: format!("{service}.service"),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 51),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames_until(&mut client, 8, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+        })
+        .await;
+
+        let (_, ack_payload) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_SCENARIO_PLAN_ACK)
+            .expect("ScenarioPlanAck 0x0E must be emitted");
+        let ack: ScenarioPlanAck = fory.deserialize(ack_payload).unwrap();
+        assert!(ack.accepted);
+        assert!(ack.rejection_reason.is_none());
+
+        let progress = progress_of(&frames);
+        assert!(progress
+            .iter()
+            .any(|p| p.test_name == "smoke_mu_cd_agent_node_a" && p.state == TestState::Passed));
+
+        let (_, report_payload) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+            .expect("IntegrationTestReport must be emitted");
+        let report: IntegrationTestReport = fory.deserialize(report_payload).unwrap();
+        assert!(report.passed);
+        assert!(report.failed_tests.is_empty());
+        assert!(report
+            .executed_tests
+            .contains(&"smoke_mu_cd_agent_node_a".to_string()));
+        let excerpt = report.log_excerpt.expect("stdout captured");
+        assert!(excerpt.contains("target=https://node-a.example:8446"));
+        assert!(excerpt.contains("args=--nocapture"));
+        assert!(!frames.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT));
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::B)
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_scenario_plan_fails_closed_on_missing_required_test_without_stub_fallback() {
+        use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
+
+        let service = "mu-cd-agent";
+        let fory = create_fory_runtime().unwrap();
+
+        // Case A: Required test missing from unpacked it_archive_digest
+        // Case B: Required scenario with it_archive_digest = None (eliminating silent 2-check stub fallback)
+        for (case_id, provide_archive) in [
+            ("dep-missing-in-bundle", true),
+            ("dep-missing-digest", false),
+        ] {
+            let temp = exec_tempdir();
+            let root = temp.path().join("muconde");
+            let cas_dir = temp.path().join("cas");
+            let srv_dir = root.join(service);
+            fs::create_dir_all(srv_dir.join("@a")).unwrap();
+            fs::create_dir_all(srv_dir.join("@b")).unwrap();
+            std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+
+            let it_digest = if provide_archive {
+                let (archive, digest) = build_test_tar_gz(&[
+                    (
+                        "manifest.json",
+                        br#"{"tests":[{"name":"smoke_other","command":"bin/other.sh","critical":true}]}"#.as_slice(),
+                        0o644,
+                    ),
+                    ("bin/other.sh", b"#!/bin/sh\nexit 0\n".as_slice(), 0o755),
+                ]);
+                write_cas_blob(&cas_dir, &digest, &archive);
+                Some(digest)
+            } else {
+                None
+            };
+
+            let config = MuConDeAgentConfig {
+                node_id: "node-a".into(),
+                muconde_root: root,
+                default_warmup_timeout_secs: 5,
+                required_consecutive_successes: 1,
+                cas_blobs_dir: Some(cas_dir),
+                ..Default::default()
+            };
+            let agent = Arc::new(MuConDeAgent::new(
+                config,
+                Arc::new(MockCommandRunner::new(true)),
+                Arc::new(MockHealthProber::new(true)),
+            ));
+            let (mut client, server) = tokio::io::duplex(256 * 1024);
+            let agent_server = agent.clone();
+            let agent_task = tokio::spawn(async move {
+                let _ = agent_server.handle_connection(server).await;
+            });
+
+            let plan = ScenarioExecutionPlan {
+                deployment_id: case_id.into(),
+                lease_id: format!("lease-{case_id}"),
+                service_name: service.into(),
+                node_id: "node-a".into(),
+                policy_commit_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
+                it_archive_digest: it_digest,
+                bundle_id: None,
+                selected_tests: vec![
+                    "systemd_unit_active".into(),
+                    "health_endpoint_ready".into(),
+                    "smoke_required_missing".into(),
+                ],
+                scenarios: vec![ScenarioTestSpec {
+                    name: "smoke_required_missing".into(),
+                    test_binary: "smoke_required_missing".into(),
+                    args: vec!["--nocapture".into()],
+                    env: Vec::new(),
+                    cidrs: vec!["127.0.0.1/32".into()],
+                    ro_mounts: Vec::new(),
+                    critical: true,
+                    timeout_secs: 10,
+                }],
+                env: Vec::new(),
+                args: Vec::new(),
+                cidrs: Vec::new(),
+                ro_mounts: Vec::new(),
+                max_pids: 256,
+                max_memlock_kb: 65_536,
+                auto_rollback_on_critical: true,
+            };
+            let plan_bytes = fory.serialize(&plan).unwrap();
+            write_frame(
+                &mut client,
+                &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 60),
+                &plan_bytes,
+            )
+            .await
+            .unwrap();
+
+            let swap_cmd = SlotSwapCommand {
+                deployment_id: case_id.into(),
+                lease_id: format!("lease-{case_id}"),
+                service_name: service.into(),
+                from_slot: DeploymentSlot::SlotA,
+                to_slot: DeploymentSlot::SlotB,
+                systemd_unit: format!("{service}.service"),
+                warmup_timeout_secs: 5,
+            };
+            let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+            write_frame(
+                &mut client,
+                &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 61),
+                &swap_bytes,
+            )
+            .await
+            .unwrap();
+
+            let frames = read_frames_until(&mut client, 5, |fs| {
+                fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                    && fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+            })
+            .await;
+
+            let (_, rep_p) = frames
+                .iter()
+                .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                .expect("IntegrationTestReport must be emitted on missing required test");
+            let report: IntegrationTestReport = fory.deserialize(rep_p).unwrap();
+            assert!(!report.passed);
+            assert!(report
+                .failed_tests
+                .contains(&"smoke_required_missing".to_string()));
+
+            let (_, taint_p) = frames
+                .iter()
+                .find(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+                .expect("ArtifactTaintNotification must be emitted on missing required test");
+            let taint: ArtifactTaintNotification = fory.deserialize(taint_p).unwrap();
+            assert!(taint.rollback_completed);
+            assert_eq!(
+                agent.slot_manager.read_active_slot(service).unwrap(),
+                Some(Slot::A)
+            );
+
+            drop(client);
+            let _ = agent_task.await;
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_scenario_plan_fails_closed_on_sandbox_denial_and_disallowed_env_with_redaction() {
+        use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
+        use mu_observable_ipc::REDACTED_PLACEHOLDER;
+
+        let service = "mu-cd-agent";
+        let fory = create_fory_runtime().unwrap();
+
+        let temp = exec_tempdir();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+        let root_canon = fs::canonicalize(&root).unwrap();
+
+        let ceiling_path = temp.path().join("ceiling.yml");
+        fs::write(
+            &ceiling_path,
+            format!(
+                r#"node_id: "node-a"
+arch: "x86_64"
+allowed_backends:
+  - Kernel
+allowed_read_prefixes:
+  - /usr
+  - /bin
+  - {root}
+allowed_write_prefixes:
+  - /tmp
+  - {root}
+allowed_exec_prefixes:
+  - /usr/bin
+  - /bin
+  - {root}
+allowed_egress_cidrs:
+  - "192.0.2.10/32"
+  - "127.0.0.1/32"
+max_memlock_kb: 65536
+max_cpu_cores: 4
+max_memory_mb: 1024
+max_pids: 256
+allow_spacemit_ai_thread: false
+"#,
+                root = root_canon.display(),
+            ),
+        )
+        .unwrap();
+
+        let (archive, it_digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"smoke_check","command":"bin/check.sh","critical":true}]}"#
+                    .as_slice(),
+                0o644,
+            ),
+            ("bin/check.sh", b"#!/bin/sh\nexit 0\n".as_slice(), 0o755),
+        ]);
+        write_cas_blob(&cas_dir, &it_digest, &archive);
+
+        let mut config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root,
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        config.it_sandbox.host_ceiling_path = Some(ceiling_path);
+
+        let agent = Arc::new(MuConDeAgent::new(
+            config,
+            Arc::new(MockCommandRunner::new(true)),
+            Arc::new(MockHealthProber::new(true)),
+        ));
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        // Case A: Out-of-ceiling CIDR 0.0.0.0/0 fails closed via SecurityGrantDenied -> rollback + taint
+        let bad_cidr_plan = ScenarioExecutionPlan {
+            deployment_id: "dep-bad-cidr".into(),
+            lease_id: "lease-bad-cidr".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
+            it_archive_digest: Some(it_digest.clone()),
+            bundle_id: None,
+            selected_tests: vec!["systemd_unit_active".into(), "smoke_check".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_check".into(),
+                test_binary: "smoke_check".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cidrs: vec!["0.0.0.0/0".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let b1 = fory.serialize(&bad_cidr_plan).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, b1.len() as u32, 0, 70),
+            &b1,
+        )
+        .await
+        .unwrap();
+        let swap1 = SlotSwapCommand {
+            deployment_id: "dep-bad-cidr".into(),
+            lease_id: "lease-bad-cidr".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: format!("{service}.service"),
+            warmup_timeout_secs: 5,
+        };
+        let s1 = fory.serialize(&swap1).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, s1.len() as u32, 0, 71),
+            &s1,
+        )
+        .await
+        .unwrap();
+
+        let frames1 = read_frames_until(&mut client, 5, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                && fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+        let (_, rep1_p) = frames1
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+            .unwrap();
+        let rep1: IntegrationTestReport = fory.deserialize(rep1_p).unwrap();
+        assert!(!rep1.passed);
+        assert!(rep1
+            .failed_tests
+            .contains(&"sandbox_policy_enforcement".to_string()));
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::A)
+        );
+
+        // Case B: Rejected plan on 0x0D (disallowed LD_PRELOAD + embedded secret) still fails closed on 0x06
+        let bad_env_plan = ScenarioExecutionPlan {
+            deployment_id: "dep-bad-env".into(),
+            lease_id: "lease-bad-env".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
+            it_archive_digest: Some(it_digest),
+            bundle_id: None,
+            selected_tests: vec!["systemd_unit_active".into(), "smoke_check".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_check".into(),
+                test_binary: "smoke_check".into(),
+                args: Vec::new(),
+                env: vec![ScenarioEnvVar {
+                    key: "LD_PRELOAD".into(),
+                    value: "token=super-secret-preload".into(),
+                }],
+                cidrs: vec!["127.0.0.1/32".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let b2 = fory.serialize(&bad_env_plan).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, b2.len() as u32, 0, 80),
+            &b2,
+        )
+        .await
+        .unwrap();
+        let swap2 = SlotSwapCommand {
+            deployment_id: "dep-bad-env".into(),
+            lease_id: "lease-bad-env".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: format!("{service}.service"),
+            warmup_timeout_secs: 5,
+        };
+        let s2 = fory.serialize(&swap2).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, s2.len() as u32, 0, 81),
+            &s2,
+        )
+        .await
+        .unwrap();
+
+        let frames2 = read_frames_until(&mut client, 5, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                && fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+        let (_, ack2_p) = frames2
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_SCENARIO_PLAN_ACK)
+            .expect("ScenarioPlanAck 0x0E must be emitted on rejection");
+        let ack2: ScenarioPlanAck = fory.deserialize(ack2_p).unwrap();
+        assert!(!ack2.accepted);
+        assert!(ack2.rejection_reason.is_some());
+
+        let (_, rep2_p) = frames2
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+            .unwrap();
+        let rep2: IntegrationTestReport = fory.deserialize(rep2_p).unwrap();
+        assert!(!rep2.passed);
+        assert!(!rep2
+            .log_excerpt
+            .as_deref()
+            .unwrap_or("")
+            .contains("super-secret-preload"));
+        let (_, taint2_p) = frames2
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+            .unwrap();
+        let taint2: ArtifactTaintNotification = fory.deserialize(taint2_p).unwrap();
+        assert!(taint2.rollback_completed);
+        assert!(!taint2.reason.contains("super-secret-preload"));
+        assert!(!REDACTED_PLACEHOLDER.is_empty());
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::A)
         );
 
         drop(client);
