@@ -198,7 +198,7 @@ pub fn candidate_binary_names(service: &str) -> &'static [&'static str] {
         "jero-manager" | "k3-manager" => &["jero-manager", "k3-manager"],
         "jero-engine" | "jero-worker" | "k3-worker" => &["jero-engine", "jero-worker", "k3-worker"],
         "jero-kv-cache" | "k3-kv" => &["jero-kv-cache", "k3-kv"],
-        "jero-runner" | "model-runner" => &["jero-engine", "jero-worker", "k3-worker"],
+        "jero-runner" | "model-runner" => &["jero-worker", "k3-worker", "jero-engine"],
         _ => &[],
     }
 }
@@ -1673,11 +1673,11 @@ mod tests {
 
         assert_eq!(
             candidate_binary_names("jero-runner"),
-            &["jero-engine", "jero-worker", "k3-worker"]
+            &["jero-worker", "k3-worker", "jero-engine"]
         );
         assert_eq!(
             candidate_binary_names("model-runner"),
-            &["jero-engine", "jero-worker", "k3-worker"]
+            &["jero-worker", "k3-worker", "jero-engine"]
         );
         assert_eq!(
             candidate_systemd_units("jero-runner"),

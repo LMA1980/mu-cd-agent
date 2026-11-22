@@ -24,9 +24,10 @@ use mu_ci_isolation::{NetworkEgressMode, MAX_K3_MEMLOCK_KB};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_rustls::TlsAcceptor;
 
 use crate::btrfs::{BtrfsManager, CommandRunner, SystemCommandRunner};
@@ -36,12 +37,12 @@ use crate::gate::{
 };
 use crate::manifest::{AbRulesConfig, DeploymentConfig, MuCdManifest};
 use crate::sandbox_it::{
-    build_it_sandbox_plan, extract_scenario_tcp_endpoints, resolve_gate_plan_with_base,
-    sanitize_and_bound_log_excerpt, unpack_verified_it_archive, validate_allowlisted_env,
-    validate_ro_mounts, validate_scenario_args, validate_sha256_digest,
-    wait_for_tcp_endpoints_ready, DiscoveredItTest, ItArchiveFetcher, ItSandboxConfig,
-    KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor, UnpackedItBundle,
-    MAX_IT_SANDBOX_PIDS, MAX_LOG_EXCERPT_BYTES, TCP_WARMUP_POLL_INTERVAL,
+    build_it_sandbox_plan, extract_scenario_tcp_endpoints, extract_scenario_unix_sockets,
+    resolve_gate_plan_with_base, sanitize_and_bound_log_excerpt, unpack_verified_it_archive,
+    validate_allowlisted_env, validate_ro_mounts, validate_scenario_args, validate_sha256_digest,
+    wait_for_tcp_endpoints_ready, wait_for_unix_sockets_ready, DiscoveredItTest, ItArchiveFetcher,
+    ItSandboxConfig, KernelSandboxedExecutor, RegistryAndCasFetcher, SandboxedCommandExecutor,
+    UnpackedItBundle, MAX_IT_SANDBOX_PIDS, MAX_LOG_EXCERPT_BYTES, TCP_WARMUP_POLL_INTERVAL,
 };
 use crate::slot::{default_cd_root, is_production_cd_root, Slot, SlotManager};
 use crate::telemetry::{
@@ -592,6 +593,295 @@ fn resolve_scenario_execution_plan(
     Ok((gate_tests, planned_custom))
 }
 
+const PENDING_SELF_UPGRADE_MAX_AGE_MS: u64 = 10 * 60 * 1000;
+const SELF_UPGRADE_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const UNDELIVERED_REPORT_QUIET_WAIT: Duration = Duration::from_millis(150);
+const DEFAULT_SELF_UPGRADE_FAILURE_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableEnvVar {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableScenarioTestSpec {
+    name: String,
+    test_binary: String,
+    args: Vec<String>,
+    env: Vec<SerializableEnvVar>,
+    cidrs: Vec<String>,
+    ro_mounts: Vec<String>,
+    critical: bool,
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableScenarioPlan {
+    deployment_id: String,
+    lease_id: String,
+    service_name: String,
+    node_id: String,
+    policy_commit_sha: String,
+    it_archive_digest: Option<String>,
+    bundle_id: Option<String>,
+    selected_tests: Vec<String>,
+    scenarios: Vec<SerializableScenarioTestSpec>,
+    env: Vec<SerializableEnvVar>,
+    args: Vec<String>,
+    cidrs: Vec<String>,
+    ro_mounts: Vec<String>,
+    max_pids: u32,
+    max_memlock_kb: u64,
+    auto_rollback_on_critical: bool,
+}
+
+impl From<&ScenarioExecutionPlan> for SerializableScenarioPlan {
+    fn from(plan: &ScenarioExecutionPlan) -> Self {
+        Self {
+            deployment_id: plan.deployment_id.clone(),
+            lease_id: plan.lease_id.clone(),
+            service_name: plan.service_name.clone(),
+            node_id: plan.node_id.clone(),
+            policy_commit_sha: plan.policy_commit_sha.clone(),
+            it_archive_digest: plan.it_archive_digest.clone(),
+            bundle_id: plan.bundle_id.clone(),
+            selected_tests: plan.selected_tests.clone(),
+            scenarios: plan
+                .scenarios
+                .iter()
+                .map(|s| SerializableScenarioTestSpec {
+                    name: s.name.clone(),
+                    test_binary: s.test_binary.clone(),
+                    args: s.args.clone(),
+                    env: s
+                        .env
+                        .iter()
+                        .map(|e| SerializableEnvVar {
+                            key: e.key.clone(),
+                            value: e.value.clone(),
+                        })
+                        .collect(),
+                    cidrs: s.cidrs.clone(),
+                    ro_mounts: s.ro_mounts.clone(),
+                    critical: s.critical,
+                    timeout_secs: s.timeout_secs,
+                })
+                .collect(),
+            env: plan
+                .env
+                .iter()
+                .map(|e| SerializableEnvVar {
+                    key: e.key.clone(),
+                    value: e.value.clone(),
+                })
+                .collect(),
+            args: plan.args.clone(),
+            cidrs: plan.cidrs.clone(),
+            ro_mounts: plan.ro_mounts.clone(),
+            max_pids: plan.max_pids,
+            max_memlock_kb: plan.max_memlock_kb,
+            auto_rollback_on_critical: plan.auto_rollback_on_critical,
+        }
+    }
+}
+
+impl From<SerializableScenarioPlan> for ScenarioExecutionPlan {
+    fn from(s: SerializableScenarioPlan) -> Self {
+        Self {
+            deployment_id: s.deployment_id,
+            lease_id: s.lease_id,
+            service_name: s.service_name,
+            node_id: s.node_id,
+            policy_commit_sha: s.policy_commit_sha,
+            it_archive_digest: s.it_archive_digest,
+            bundle_id: s.bundle_id,
+            selected_tests: s.selected_tests,
+            scenarios: s
+                .scenarios
+                .into_iter()
+                .map(|sp| ScenarioTestSpec {
+                    name: sp.name,
+                    test_binary: sp.test_binary,
+                    args: sp.args,
+                    env: sp
+                        .env
+                        .into_iter()
+                        .map(|e| ScenarioEnvVar {
+                            key: e.key,
+                            value: e.value,
+                        })
+                        .collect(),
+                    cidrs: sp.cidrs,
+                    ro_mounts: sp.ro_mounts,
+                    critical: sp.critical,
+                    timeout_secs: sp.timeout_secs,
+                })
+                .collect(),
+            env: s
+                .env
+                .into_iter()
+                .map(|e| ScenarioEnvVar {
+                    key: e.key,
+                    value: e.value,
+                })
+                .collect(),
+            args: s.args,
+            cidrs: s.cidrs,
+            ro_mounts: s.ro_mounts,
+            max_pids: s.max_pids,
+            max_memlock_kb: s.max_memlock_kb,
+            auto_rollback_on_critical: s.auto_rollback_on_critical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingSelfUpgrade {
+    deployment_id: String,
+    lease_id: String,
+    service_name: String,
+    from_slot: String,
+    to_slot: String,
+    candidate_sha256: String,
+    systemd_unit: String,
+    warmup_timeout_secs: u64,
+    scenario_plan: Option<SerializableScenarioPlan>,
+    deployment_config: Option<DeploymentConfig>,
+    rollback_deployment: Option<DeploymentConfig>,
+    created_epoch_ms: u64,
+}
+
+/// Canonical persistent handoff path written prior to a detached agent self-restart.
+pub fn pending_self_upgrade_path(muconde_root: &Path) -> PathBuf {
+    muconde_root
+        .join("mu-cd-agent")
+        .join(".pending_self_upgrade.json")
+}
+
+fn write_pending_self_upgrade_atomic(
+    path: &Path,
+    pending: &PendingSelfUpgrade,
+) -> Result<(), AgentError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(pending)
+        .map_err(|e| AgentError::Serialization(format!("PendingSelfUpgrade JSON encode: {e}")))?;
+    let tmp_path = path.with_file_name(format!(
+        ".pending_self_upgrade.json.tmp.{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&tmp_path, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(AgentError::Io(err));
+    }
+    Ok(())
+}
+
+fn claim_pending_self_upgrade(path: &Path) -> Result<Option<PendingSelfUpgrade>, AgentError> {
+    let claimed_path = path.with_file_name(format!(
+        ".pending_self_upgrade.json.claimed.{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    match std::fs::rename(path, &claimed_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(AgentError::Io(e)),
+    }
+    let raw = std::fs::read(&claimed_path);
+    let _ = std::fs::remove_file(&claimed_path);
+    let bytes = raw?;
+    let pending: PendingSelfUpgrade = serde_json::from_slice(&bytes)
+        .map_err(|e| AgentError::Config(format!("Invalid .pending_self_upgrade.json: {e}")))?;
+    let age_ms = now_epoch_ms().saturating_sub(pending.created_epoch_ms);
+    if age_ms >= PENDING_SELF_UPGRADE_MAX_AGE_MS {
+        tracing::warn!(
+            deployment_id = %pending.deployment_id,
+            age_ms,
+            "Ignoring expired .pending_self_upgrade.json (>10 min old)"
+        );
+        return Ok(None);
+    }
+    Ok(Some(pending))
+}
+
+async fn validate_self_upgrade_binary(bin_path: &Path, timeout: Duration) -> Result<(), String> {
+    let output = tokio::time::timeout(
+        timeout,
+        tokio::process::Command::new(bin_path)
+            .arg("--version")
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Self-upgrade binary '{}' timed out after {}ms during --version validation",
+            bin_path.display(),
+            timeout.as_millis()
+        )
+    })?
+    .map_err(|e| {
+        format!(
+            "Failed executing self-upgrade binary '{}' --version: {e}",
+            bin_path.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Self-upgrade binary '{}' --version exited with {}: {}",
+            bin_path.display(),
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+struct PendingReportChannel {
+    deployment_id: String,
+    rx: watch::Receiver<Option<IntegrationTestReport>>,
+    created_epoch_ms: u64,
+}
+
+async fn await_pending_report(ch: &mut PendingReportChannel) -> Option<IntegrationTestReport> {
+    if let Some(rep) = ch.rx.borrow().clone() {
+        return Some(rep);
+    }
+    let elapsed_ms = now_epoch_ms().saturating_sub(ch.created_epoch_ms);
+    let remaining_ms = PENDING_SELF_UPGRADE_MAX_AGE_MS.saturating_sub(elapsed_ms);
+    if remaining_ms == 0 {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining_ms);
+    loop {
+        if let Some(rep) = ch.rx.borrow().clone() {
+            return Some(rep);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        match tokio::time::timeout(deadline - now, ch.rx.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_)) | Err(_) => return ch.rx.borrow().clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapConnectionAction {
+    Continue,
+    Close,
+}
+
 /// Continuous delivery node agent running as a resident systemd daemon.
 pub struct MuConDeAgent {
     config: MuConDeAgentConfig,
@@ -605,6 +895,9 @@ pub struct MuConDeAgent {
     staged_slots: Arc<Mutex<HashMap<String, (Slot, Slot)>>>,
     swap_units: Arc<Mutex<HashMap<String, String>>>,
     scenario_plans: Arc<Mutex<HashMap<String, StoredScenarioPlan>>>,
+    undelivered_report: Arc<Mutex<Option<PendingReportChannel>>>,
+    undelivered_report_notify: Arc<tokio::sync::Notify>,
+    self_upgrade_failure_window: Duration,
 }
 
 struct ServiceContract {
@@ -673,7 +966,18 @@ impl MuConDeAgent {
             staged_slots: Arc::new(Mutex::new(HashMap::new())),
             swap_units: Arc::new(Mutex::new(HashMap::new())),
             scenario_plans: Arc::new(Mutex::new(HashMap::new())),
+            undelivered_report: Arc::new(Mutex::new(None)),
+            undelivered_report_notify: Arc::new(tokio::sync::Notify::new()),
+            self_upgrade_failure_window: DEFAULT_SELF_UPGRADE_FAILURE_WINDOW,
         }
+    }
+
+    /// Overrides the brief report-delivery wait window prior to self-restart after a failed
+    /// post-restart self-upgrade gate (primarily for deterministic fast unit tests).
+    #[must_use]
+    pub fn with_self_upgrade_failure_window(mut self, window: Duration) -> Self {
+        self.self_upgrade_failure_window = window;
+        self
     }
 
     /// Replaces the default `MuObserveCollectorSink` with a custom [`TelemetrySink`].
@@ -745,6 +1049,94 @@ impl MuConDeAgent {
             staged_slots: self.staged_slots.clone(),
             swap_units: self.swap_units.clone(),
             scenario_plans: self.scenario_plans.clone(),
+            undelivered_report: self.undelivered_report.clone(),
+            undelivered_report_notify: self.undelivered_report_notify.clone(),
+            self_upgrade_failure_window: self.self_upgrade_failure_window,
+        }
+    }
+
+    async fn arm_undelivered_report(
+        &self,
+        deployment_id: String,
+    ) -> watch::Sender<Option<IntegrationTestReport>> {
+        let (tx, rx) = watch::channel(None);
+        *self.undelivered_report.lock().await = Some(PendingReportChannel {
+            deployment_id,
+            rx,
+            created_epoch_ms: now_epoch_ms(),
+        });
+        self.undelivered_report_notify.notify_waiters();
+        tx
+    }
+
+    async fn cache_undelivered_report(&self, report: IntegrationTestReport) {
+        let deployment_id = report.deployment_id.clone();
+        let (tx, rx) = watch::channel(Some(report));
+        // `watch::Receiver::borrow()` retains the latest value even after `tx` is dropped.
+        drop(tx);
+        *self.undelivered_report.lock().await = Some(PendingReportChannel {
+            deployment_id,
+            rx,
+            created_epoch_ms: now_epoch_ms(),
+        });
+        self.undelivered_report_notify.notify_waiters();
+    }
+
+    async fn has_fresh_undelivered_report(&self) -> bool {
+        let mut guard = self.undelivered_report.lock().await;
+        if let Some(ref ch) = *guard {
+            if now_epoch_ms().saturating_sub(ch.created_epoch_ms) < PENDING_SELF_UPGRADE_MAX_AGE_MS
+            {
+                return true;
+            }
+            tracing::warn!(
+                deployment_id = %ch.deployment_id,
+                "Expiring stale undelivered_report entry (>10 min old)"
+            );
+            *guard = None;
+        }
+        false
+    }
+
+    async fn claim_undelivered_report(&self) -> Option<PendingReportChannel> {
+        let mut guard = self.undelivered_report.lock().await;
+        let ch = guard.take()?;
+        if now_epoch_ms().saturating_sub(ch.created_epoch_ms) < PENDING_SELF_UPGRADE_MAX_AGE_MS {
+            Some(ch)
+        } else {
+            None
+        }
+    }
+
+    async fn deliver_or_cache_it_report<S: AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+        fory: &fory::Fory,
+        report: &IntegrationTestReport,
+        sequence: u64,
+    ) -> Result<bool, AgentError> {
+        match write_it_report_frame(stream, fory, report, sequence).await {
+            Ok(()) => Ok(true),
+            Err(AgentError::Ipc(mu_cd_ipc::IpcError::Io(ref e)))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                tracing::warn!(
+                    deployment_id = %report.deployment_id,
+                    service = %report.service_name,
+                    passed = report.passed,
+                    error = %e,
+                    "Controller disconnected before IntegrationTestReport write; caching report for reconnect"
+                );
+                self.cache_undelivered_report(report.clone()).await;
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -821,17 +1213,96 @@ impl MuConDeAgent {
         mut stream: S,
     ) -> Result<(), AgentError> {
         let fory = create_fory_runtime()?;
+        let mut received_any_frame = false;
 
         loop {
-            let (header, payload) = match read_frame(&mut stream).await {
-                Ok(frame) => frame,
-                Err(mu_cd_ipc::IpcError::Io(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    tracing::debug!("Client disconnected cleanly");
-                    return Ok(());
+            let (header, payload) = if !received_any_frame {
+                // Register waiter before inspecting `undelivered_report` so a concurrent
+                // `cache_undelivered_report` cannot race past `select!`.
+                let notified = self.undelivered_report_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                if self.has_fresh_undelivered_report().await {
+                    tokio::select! {
+                        frame_res = read_frame(&mut stream) => {
+                            received_any_frame = true;
+                            match frame_res {
+                                Ok(frame) => frame,
+                                Err(mu_cd_ipc::IpcError::Io(ref e))
+                                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                                {
+                                    tracing::debug!("Client disconnected cleanly");
+                                    return Ok(());
+                                }
+                                Err(e) => return Err(AgentError::Ipc(e)),
+                            }
+                        }
+                        () = tokio::time::sleep(UNDELIVERED_REPORT_QUIET_WAIT) => {
+                            if let Some(mut ch) = self.claim_undelivered_report().await {
+                                tracing::info!(
+                                    deployment_id = %ch.deployment_id,
+                                    "Silent reconnecting controller detected; awaiting undelivered IntegrationTestReport"
+                                );
+                                if let Some(report) = await_pending_report(&mut ch).await {
+                                    if let Err(err) =
+                                        write_it_report_frame(&mut stream, &fory, &report, 0).await
+                                    {
+                                        tracing::warn!(
+                                            deployment_id = %report.deployment_id,
+                                            error = %err,
+                                            "Failed writing cached IntegrationTestReport on reconnect; re-caching"
+                                        );
+                                        self.cache_undelivered_report(report).await;
+                                        return Ok(());
+                                    }
+                                    tracing::info!(
+                                        deployment_id = %report.deployment_id,
+                                        passed = report.passed,
+                                        "Delivered cached IntegrationTestReport to reconnecting controller"
+                                    );
+                                    received_any_frame = true;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        frame_res = read_frame(&mut stream) => {
+                            received_any_frame = true;
+                            match frame_res {
+                                Ok(frame) => frame,
+                                Err(mu_cd_ipc::IpcError::Io(ref e))
+                                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                                {
+                                    tracing::debug!("Client disconnected cleanly");
+                                    return Ok(());
+                                }
+                                Err(e) => return Err(AgentError::Ipc(e)),
+                            }
+                        }
+                        () = notified => {
+                            // An in-flight gate cached an undelivered report while this silent
+                            // reconnecting controller was already waiting.
+                            continue;
+                        }
+                    }
                 }
-                Err(e) => return Err(AgentError::Ipc(e)),
+            } else {
+                match read_frame(&mut stream).await {
+                    Ok(frame) => {
+                        received_any_frame = true;
+                        frame
+                    }
+                    Err(mu_cd_ipc::IpcError::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        tracing::debug!("Client disconnected cleanly");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(AgentError::Ipc(e)),
+                }
             };
 
             match header.msg_type {
@@ -1051,8 +1522,12 @@ impl MuConDeAgent {
                         "Received SlotSwapCommand"
                     );
 
-                    self.execute_slot_swap_and_gate(&mut stream, &fory, header.sequence, cmd)
+                    let action = self
+                        .execute_slot_swap_and_gate(&mut stream, &fory, header.sequence, cmd)
                         .await?;
+                    if action == SwapConnectionAction::Close {
+                        return Ok(());
+                    }
                 }
 
                 MSG_TYPE_ROLLBACK => {
@@ -1243,6 +1718,8 @@ impl MuConDeAgent {
             None
         };
 
+        self.spawn_pending_self_upgrade_if_present().await;
+
         loop {
             let (stream, remote_addr) = listener.accept().await?;
             tracing::debug!(remote = %remote_addr, "Accepted incoming IPC connection");
@@ -1368,7 +1845,7 @@ impl MuConDeAgent {
         fory: &fory::Fory,
         sequence: u64,
         cmd: SlotSwapCommand,
-    ) -> Result<(), AgentError> {
+    ) -> Result<SwapConnectionAction, AgentError> {
         let swap_start_ns = now_unix_nano();
         let swap_trace_ctx = trace_context_for_deployment(&cmd.deployment_id, 2);
 
@@ -1397,19 +1874,19 @@ impl MuConDeAgent {
             .copied()
         {
             if target_slot != recorded_staged || restore_slot != recorded_prev {
-                return self
-                    .handle_slot_inversion_rejection(
-                        stream,
-                        fory,
-                        sequence,
-                        &cmd,
-                        recorded_staged,
-                        recorded_prev,
-                        &candidate_sha256,
-                        &swap_trace_ctx,
-                        swap_start_ns,
-                    )
-                    .await;
+                self.handle_slot_inversion_rejection(
+                    stream,
+                    fory,
+                    sequence,
+                    &cmd,
+                    recorded_staged,
+                    recorded_prev,
+                    &candidate_sha256,
+                    &swap_trace_ctx,
+                    swap_start_ns,
+                )
+                .await?;
+                return Ok(SwapConnectionAction::Continue);
             }
         }
 
@@ -1423,6 +1900,64 @@ impl MuConDeAgent {
             .lock()
             .await
             .insert(cmd.deployment_id.clone(), cmd.systemd_unit.clone());
+
+        let is_self_upgrade = matches!(cmd.service_name.as_str(), "mu-cd-agent" | "muconde-agent")
+            || contract
+                .deployment
+                .as_ref()
+                .is_some_and(|d| d.self_upgrade_guard);
+        let saved_scenario_plan = if is_self_upgrade {
+            match self.scenario_plans.lock().await.get(&cmd.deployment_id) {
+                Some(StoredScenarioPlan::Accepted(plan)) => {
+                    Some(SerializableScenarioPlan::from(plan.as_ref()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Pre-swap gate & IT bundle verification: fetch and verify it_archive_digest BEFORE
+        // swapping/restarting the live service so services like mu-registry are never bounced
+        // before their IT archive is fetched and bad archives never restart healthy services.
+        let (gate_tests, custom_tests, _unpack_guard, ab_rules) =
+            match self.prepare_gate_and_bundle(&cmd, target_slot).await {
+                Ok(plan) => plan,
+                Err(gate_err) => {
+                    self.handle_gate_preflight_failure(
+                        stream,
+                        fory,
+                        sequence,
+                        &cmd,
+                        restore_slot,
+                        &candidate_sha256,
+                        &swap_trace_ctx,
+                        swap_start_ns,
+                        gate_err,
+                    )
+                    .await?;
+                    return Ok(SwapConnectionAction::Continue);
+                }
+            };
+
+        if is_self_upgrade {
+            return self
+                .execute_self_upgrade_swap_and_handoff(
+                    stream,
+                    fory,
+                    sequence,
+                    &cmd,
+                    target_slot,
+                    restore_slot,
+                    &candidate_sha256,
+                    &swap_trace_ctx,
+                    swap_start_ns,
+                    contract.deployment.as_ref(),
+                    rollback_deployment.as_ref(),
+                    saved_scenario_plan,
+                )
+                .await;
+        }
 
         let _receipt = self.slot_manager.atomic_swap_active_slot_with_deployment(
             &cmd.service_name,
@@ -1486,27 +2021,6 @@ impl MuConDeAgent {
 
         self.telemetry_sink.emit_spans(vec![swap_span]).await;
         self.telemetry_sink.emit_metrics(vec![slot_metric]).await;
-
-        let (gate_tests, custom_tests, _unpack_guard, ab_rules) =
-            match self.prepare_gate_and_bundle(&cmd, target_slot).await {
-                Ok(plan) => plan,
-                Err(gate_err) => {
-                    return self
-                        .handle_gate_preflight_failure(
-                            stream,
-                            fory,
-                            sequence,
-                            &cmd,
-                            restore_slot,
-                            &candidate_sha256,
-                            &swap_trace_ctx,
-                            swap_end_ns,
-                            gate_err,
-                            rollback_deployment.as_ref(),
-                        )
-                        .await;
-                }
-            };
 
         let mut gate = GateTracker::new(&cmd.deployment_id, gate_tests);
         send_it_progress(stream, fory, &gate.pending_updates(), sequence).await;
@@ -1635,34 +2149,15 @@ impl MuConDeAgent {
                     .log_excerpt
                     .as_deref()
                     .map(|raw| sanitize_and_bound_log_excerpt(raw, MAX_LOG_EXCERPT_BYTES));
-                write_it_report_frame(stream, fory, &report, sequence).await?;
-                write_taint_frame(stream, fory, &taint, sequence).await?;
+                if self
+                    .deliver_or_cache_it_report(stream, fory, &report, sequence)
+                    .await?
+                {
+                    let _ = write_taint_frame(stream, fory, &taint, sequence).await;
+                }
             }
             Ok(Ok(WatchdogOutcome::WarmedUp { .. })) => {
-                let mut tcp_endpoints: Vec<(String, u16)> = Vec::new();
-                for planned in &custom_tests {
-                    for ep in extract_scenario_tcp_endpoints(&planned.sandbox_cfg.allowlisted_env) {
-                        if !tcp_endpoints.contains(&ep) {
-                            tcp_endpoints.push(ep);
-                        }
-                    }
-                }
-                if !tcp_endpoints.is_empty() && cmd.warmup_timeout_secs > 0 {
-                    if let Err(detail) = wait_for_tcp_endpoints_ready(
-                        &tcp_endpoints,
-                        Duration::from_secs(cmd.warmup_timeout_secs),
-                        TCP_WARMUP_POLL_INTERVAL,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            deployment_id = %cmd.deployment_id,
-                            service = %cmd.service_name,
-                            detail = %detail,
-                            "Warmup TCP readiness probe timed out; proceeding to sandboxed scenario probes"
-                        );
-                    }
-                }
+                self.wait_for_scenario_endpoints(&cmd, &custom_tests).await;
 
                 let mut builtin_finished = Vec::new();
                 for name in gate.names() {
@@ -1711,7 +2206,7 @@ impl MuConDeAgent {
             }
         }
 
-        Ok(())
+        Ok(SwapConnectionAction::Continue)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1818,9 +2313,8 @@ impl MuConDeAgent {
         restore_slot: Slot,
         candidate_sha256: &str,
         swap_trace_ctx: &mu_observable_ipc::TraceContext,
-        swap_end_ns: i64,
+        swap_start_ns: i64,
         gate_err: AgentError,
-        rollback_deployment: Option<&DeploymentConfig>,
     ) -> Result<(), AgentError> {
         let safe_reason =
             sanitize_and_bound_log_excerpt(&gate_err.to_string(), MAX_LOG_EXCERPT_BYTES);
@@ -1839,31 +2333,41 @@ impl MuConDeAgent {
         let finished = tracker.finish_remaining(|_| false);
         send_it_progress(stream, fory, &finished, sequence).await;
 
-        let (mut report, taint, elapsed_rollback_ms) =
-            self.watchdog_monitor.execute_rollback_with_deployment(
-                &cmd.deployment_id,
-                &cmd.service_name,
-                restore_slot,
-                candidate_sha256,
-                &safe_reason,
-                rollback_deployment,
-                Some(cmd.systemd_unit.as_str()),
-            )?;
+        // Preflight runs BEFORE slot swap/restart, so live service remains untouched on restore_slot.
         self.emit_rollback_span(
             cmd,
             restore_slot,
-            &taint.reason,
+            &safe_reason,
             swap_trace_ctx,
-            swap_end_ns,
-            elapsed_rollback_ms,
+            swap_start_ns,
+            0,
         )
         .await;
 
-        report.executed_tests = failed_tests.clone();
-        report.failed_tests = failed_tests;
-        report.log_excerpt = Some(safe_reason);
-        write_it_report_frame(stream, fory, &report, sequence).await?;
-        write_taint_frame(stream, fory, &taint, sequence).await?;
+        let report = IntegrationTestReport {
+            deployment_id: cmd.deployment_id.clone(),
+            service_name: cmd.service_name.clone(),
+            artifact_sha256: candidate_sha256.to_string(),
+            executed_tests: failed_tests.clone(),
+            passed: false,
+            failed_tests,
+            duration_ms: 0,
+            log_excerpt: Some(safe_reason.clone()),
+        };
+        let taint = ArtifactTaintNotification {
+            deployment_id: cmd.deployment_id.clone(),
+            service_name: cmd.service_name.clone(),
+            artifact_sha256: candidate_sha256.to_string(),
+            tainted_at_epoch_ms: now_epoch_ms(),
+            reason: safe_reason,
+            rollback_completed: true,
+        };
+        if self
+            .deliver_or_cache_it_report(stream, fory, &report, sequence)
+            .await?
+        {
+            let _ = write_taint_frame(stream, fory, &taint, sequence).await;
+        }
         Ok(())
     }
 
@@ -1987,8 +2491,12 @@ impl MuConDeAgent {
                     MAX_LOG_EXCERPT_BYTES,
                 ));
 
-                write_it_report_frame(stream, fory, &report, sequence).await?;
-                write_taint_frame(stream, fory, &taint, sequence).await?;
+                if self
+                    .deliver_or_cache_it_report(stream, fory, &report, sequence)
+                    .await?
+                {
+                    let _ = write_taint_frame(stream, fory, &taint, sequence).await;
+                }
                 return Ok(());
             }
         }
@@ -2015,8 +2523,430 @@ impl MuConDeAgent {
         if report.passed {
             self.staged_slots.lock().await.remove(&cmd.deployment_id);
         }
-        write_it_report_frame(stream, fory, &report, sequence).await?;
+        let _ = self
+            .deliver_or_cache_it_report(stream, fory, &report, sequence)
+            .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_self_upgrade_swap_and_handoff<S: AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+        fory: &fory::Fory,
+        sequence: u64,
+        cmd: &SlotSwapCommand,
+        target_slot: Slot,
+        restore_slot: Slot,
+        candidate_sha256: &str,
+        swap_trace_ctx: &mu_observable_ipc::TraceContext,
+        swap_start_ns: i64,
+        deployment: Option<&DeploymentConfig>,
+        rollback_deployment: Option<&DeploymentConfig>,
+        scenario_plan: Option<SerializableScenarioPlan>,
+    ) -> Result<SwapConnectionAction, AgentError> {
+        let swap_receipt = self.slot_manager.atomic_swap_active_slot_for_self_upgrade(
+            &cmd.service_name,
+            target_slot,
+            deployment,
+            Some(&cmd.systemd_unit),
+        )?;
+
+        if let Some(ref installed_bin) = swap_receipt.installed_binary_path {
+            if let Err(err_msg) =
+                validate_self_upgrade_binary(installed_bin, SELF_UPGRADE_VERSION_TIMEOUT).await
+            {
+                let rb_start = Instant::now();
+                let _ = self.slot_manager.restore_slot_without_restart(
+                    &cmd.service_name,
+                    restore_slot,
+                    rollback_deployment,
+                    Some(&cmd.systemd_unit),
+                );
+                let elapsed_rollback_ms = rb_start.elapsed().as_millis() as u64;
+                let safe_reason = sanitize_and_bound_log_excerpt(&err_msg, MAX_LOG_EXCERPT_BYTES);
+                let test_name = "self_upgrade_binary_validation".to_string();
+                let mut tracker = GateTracker::new(
+                    &cmd.deployment_id,
+                    vec![GateTest::new(test_name.clone(), true)],
+                );
+                send_it_progress(stream, fory, &tracker.pending_updates(), sequence).await;
+                send_it_progress(stream, fory, &tracker.start_all(), sequence).await;
+                let finished = tracker.finish_remaining(|_| false);
+                send_it_progress(stream, fory, &finished, sequence).await;
+
+                self.emit_rollback_span(
+                    cmd,
+                    restore_slot,
+                    &safe_reason,
+                    swap_trace_ctx,
+                    swap_start_ns,
+                    elapsed_rollback_ms,
+                )
+                .await;
+
+                let report = IntegrationTestReport {
+                    deployment_id: cmd.deployment_id.clone(),
+                    service_name: cmd.service_name.clone(),
+                    artifact_sha256: candidate_sha256.to_string(),
+                    executed_tests: vec![test_name.clone()],
+                    passed: false,
+                    failed_tests: vec![test_name],
+                    duration_ms: elapsed_rollback_ms,
+                    log_excerpt: Some(safe_reason.clone()),
+                };
+                let taint = ArtifactTaintNotification {
+                    deployment_id: cmd.deployment_id.clone(),
+                    service_name: cmd.service_name.clone(),
+                    artifact_sha256: candidate_sha256.to_string(),
+                    tainted_at_epoch_ms: now_epoch_ms(),
+                    reason: safe_reason,
+                    rollback_completed: true,
+                };
+                if self
+                    .deliver_or_cache_it_report(stream, fory, &report, sequence)
+                    .await?
+                {
+                    let _ = write_taint_frame(stream, fory, &taint, sequence).await;
+                }
+                return Ok(SwapConnectionAction::Continue);
+            }
+        }
+
+        let pending = PendingSelfUpgrade {
+            deployment_id: cmd.deployment_id.clone(),
+            lease_id: cmd.lease_id.clone(),
+            service_name: cmd.service_name.clone(),
+            from_slot: restore_slot.as_str().to_string(),
+            to_slot: target_slot.as_str().to_string(),
+            candidate_sha256: candidate_sha256.to_string(),
+            systemd_unit: swap_receipt.resolved_unit.clone(),
+            warmup_timeout_secs: cmd.warmup_timeout_secs,
+            scenario_plan,
+            deployment_config: deployment.cloned(),
+            rollback_deployment: rollback_deployment.cloned(),
+            created_epoch_ms: now_epoch_ms(),
+        };
+        let handoff_path = pending_self_upgrade_path(&self.config.muconde_root);
+        write_pending_self_upgrade_atomic(&handoff_path, &pending)?;
+
+        let swap_end_ns = now_unix_nano().max(swap_start_ns);
+        let swap_span = OtelSpanEntry {
+            trace_id: swap_trace_ctx.trace_id_hex(),
+            span_id: swap_trace_ctx.span_id_hex(),
+            parent_span_id: None,
+            service_name: AGENT_SERVICE_NAME.to_string(),
+            node_id: self.config.node_id.clone(),
+            span_name: "muconde.agent.slot_swap".to_string(),
+            span_kind: "SERVER".to_string(),
+            start_time_unix_nano: swap_start_ns,
+            end_time_unix_nano: swap_end_ns,
+            duration_ns: (swap_end_ns - swap_start_ns) as u64,
+            status_code: "OK".to_string(),
+            status_message: None,
+            attributes_json: serde_json::json!({
+                "deployment_id": cmd.deployment_id,
+                "lease_id": cmd.lease_id,
+                "service_name": cmd.service_name,
+                "from_slot": format!("{:?}", cmd.from_slot),
+                "to_slot": format!("{:?}", cmd.to_slot),
+                "subvolume": target_slot.as_str(),
+                "systemd_unit": swap_receipt.resolved_unit,
+                "self_upgrade_handoff": true,
+            })
+            .to_string(),
+        };
+        self.telemetry_sink.emit_spans(vec![swap_span]).await;
+
+        self.slot_manager
+            .run_systemctl_restart_no_block(&swap_receipt.resolved_unit)?;
+        Ok(SwapConnectionAction::Close)
+    }
+
+    async fn spawn_pending_self_upgrade_if_present(&self) {
+        let handoff_path = pending_self_upgrade_path(&self.config.muconde_root);
+        let pending = match claim_pending_self_upgrade(&handoff_path) {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    path = %handoff_path.display(),
+                    error = %e,
+                    "Failed loading .pending_self_upgrade.json on startup"
+                );
+                return;
+            }
+        };
+
+        tracing::info!(
+            deployment_id = %pending.deployment_id,
+            service = %pending.service_name,
+            from_slot = %pending.from_slot,
+            to_slot = %pending.to_slot,
+            "Claimed .pending_self_upgrade.json on startup; arming post-restart self-upgrade gate"
+        );
+
+        let report_tx = self
+            .arm_undelivered_report(pending.deployment_id.clone())
+            .await;
+        if let Some(ref plan) = pending.scenario_plan {
+            self.scenario_plans.lock().await.insert(
+                pending.deployment_id.clone(),
+                StoredScenarioPlan::Accepted(Box::new(ScenarioExecutionPlan::from(plan.clone()))),
+            );
+        }
+        self.staged_digests.lock().await.insert(
+            pending.deployment_id.clone(),
+            pending.candidate_sha256.clone(),
+        );
+        if let (Some(to_slot), Some(from_slot)) = (
+            Slot::from_target_str(&pending.to_slot),
+            Slot::from_target_str(&pending.from_slot),
+        ) {
+            self.staged_slots
+                .lock()
+                .await
+                .insert(pending.deployment_id.clone(), (to_slot, from_slot));
+        }
+
+        let bg_agent = self.clone_for_connection();
+        tokio::spawn(async move {
+            bg_agent
+                .run_post_restart_self_upgrade_gate(pending, report_tx)
+                .await;
+        });
+    }
+
+    async fn run_post_restart_self_upgrade_gate(
+        &self,
+        pending: PendingSelfUpgrade,
+        report_tx: watch::Sender<Option<IntegrationTestReport>>,
+    ) {
+        let suite_start = Instant::now();
+        let swap_trace_ctx = trace_context_for_deployment(&pending.deployment_id, 2);
+        let gate_start_ns = now_unix_nano();
+        let target_slot = Slot::from_target_str(&pending.to_slot).unwrap_or(Slot::B);
+        let restore_slot = Slot::from_target_str(&pending.from_slot).unwrap_or(Slot::A);
+
+        let cmd = SlotSwapCommand {
+            deployment_id: pending.deployment_id.clone(),
+            lease_id: pending.lease_id.clone(),
+            service_name: pending.service_name.clone(),
+            from_slot: mu_cd_ipc::DeploymentSlot::from(restore_slot),
+            to_slot: mu_cd_ipc::DeploymentSlot::from(target_slot),
+            systemd_unit: pending.systemd_unit.clone(),
+            warmup_timeout_secs: pending.warmup_timeout_secs,
+        };
+
+        let report = match self.prepare_gate_and_bundle(&cmd, target_slot).await {
+            Ok((gate_tests, custom_tests, _unpack_guard, _ab_rules)) => {
+                self.wait_for_scenario_endpoints(&cmd, &custom_tests).await;
+
+                let mut gate = GateTracker::new(&cmd.deployment_id, gate_tests);
+                let custom_names: Vec<String> =
+                    custom_tests.iter().map(|t| t.test.name.clone()).collect();
+                for name in gate.names() {
+                    if !custom_names.contains(&name) {
+                        let _ = gate.start_test(&name);
+                        let _ = gate.finish(&name, true);
+                    }
+                }
+
+                let mut aggregated_logs = String::new();
+                for planned in &custom_tests {
+                    let test = &planned.test;
+                    let _ = gate.start_test(&test.name);
+                    let timeout = Duration::from_secs(
+                        test.timeout_secs
+                            .unwrap_or(planned.sandbox_cfg.per_test_timeout_secs),
+                    );
+                    let exec_res = self
+                        .it_executor
+                        .execute_in_sandbox(
+                            test,
+                            &test.working_dir,
+                            &planned.sandbox_cfg,
+                            &cmd.service_name,
+                            target_slot,
+                            timeout,
+                        )
+                        .await;
+                    let (passed, detail_log) = match exec_res {
+                        Ok(out) => {
+                            let raw = if !out.log_output.trim().is_empty() {
+                                out.log_output
+                            } else if !out.passed {
+                                format!("exited with code {:?} (no output)", out.exit_code)
+                            } else {
+                                String::new()
+                            };
+                            let safe = if raw.is_empty() {
+                                raw
+                            } else {
+                                sanitize_and_bound_log_excerpt(&raw, MAX_LOG_EXCERPT_BYTES)
+                            };
+                            (out.passed, safe)
+                        }
+                        Err(err) => (
+                            false,
+                            sanitize_and_bound_log_excerpt(
+                                &format!("Sandbox execution failed: {err}"),
+                                MAX_LOG_EXCERPT_BYTES,
+                            ),
+                        ),
+                    };
+                    if !detail_log.is_empty() {
+                        aggregated_logs.push_str(&format!("[{}] {}\n", test.name, detail_log));
+                    }
+                    let _ = gate.finish(&test.name, passed);
+                }
+
+                let failed_tests = gate.names_in(TestState::Failed);
+                let critical_failures = gate.critical_failures();
+                IntegrationTestReport {
+                    deployment_id: cmd.deployment_id.clone(),
+                    service_name: cmd.service_name.clone(),
+                    artifact_sha256: pending.candidate_sha256.clone(),
+                    executed_tests: gate.names(),
+                    passed: critical_failures.is_empty(),
+                    failed_tests,
+                    duration_ms: suite_start.elapsed().as_millis() as u64,
+                    log_excerpt: if aggregated_logs.trim().is_empty() {
+                        None
+                    } else {
+                        Some(sanitize_and_bound_log_excerpt(
+                            &aggregated_logs,
+                            MAX_LOG_EXCERPT_BYTES,
+                        ))
+                    },
+                }
+            }
+            Err(gate_err) => {
+                let safe_reason =
+                    sanitize_and_bound_log_excerpt(&gate_err.to_string(), MAX_LOG_EXCERPT_BYTES);
+                IntegrationTestReport {
+                    deployment_id: cmd.deployment_id.clone(),
+                    service_name: cmd.service_name.clone(),
+                    artifact_sha256: pending.candidate_sha256.clone(),
+                    executed_tests: vec!["self_upgrade_post_restart_gate".to_string()],
+                    passed: false,
+                    failed_tests: vec!["self_upgrade_post_restart_gate".to_string()],
+                    duration_ms: suite_start.elapsed().as_millis() as u64,
+                    log_excerpt: Some(safe_reason),
+                }
+            }
+        };
+
+        if report.passed {
+            self.staged_slots.lock().await.remove(&cmd.deployment_id);
+            tracing::info!(
+                deployment_id = %cmd.deployment_id,
+                service = %cmd.service_name,
+                "Post-restart self-upgrade gate PASSED; publishing report for controller reconnect"
+            );
+            let _ = report_tx.send(Some(report));
+            return;
+        }
+
+        let rb_start = Instant::now();
+        let rb_res = self.slot_manager.restore_slot_without_restart(
+            &pending.service_name,
+            restore_slot,
+            pending.rollback_deployment.as_ref(),
+            Some(&pending.systemd_unit),
+        );
+        let elapsed_rollback_ms = rb_start.elapsed().as_millis() as u64;
+        if let Err(ref err) = rb_res {
+            tracing::error!(
+                deployment_id = %cmd.deployment_id,
+                error = %err,
+                "Failed restoring previous slot during post-restart self-upgrade rollback"
+            );
+        }
+        let reason = report
+            .log_excerpt
+            .as_deref()
+            .unwrap_or("Post-restart self-upgrade integration gate failed");
+        self.emit_rollback_span(
+            &cmd,
+            restore_slot,
+            reason,
+            &swap_trace_ctx,
+            gate_start_ns,
+            elapsed_rollback_ms,
+        )
+        .await;
+        tracing::warn!(
+            deployment_id = %cmd.deployment_id,
+            restore_slot = restore_slot.as_str(),
+            elapsed_rollback_ms,
+            "Post-restart self-upgrade gate FAILED; restored previous slot, publishing report before detached restart"
+        );
+        let _ = report_tx.send(Some(report));
+        if !self.self_upgrade_failure_window.is_zero() {
+            tokio::time::sleep(self.self_upgrade_failure_window).await;
+        }
+        if let Err(err) = self
+            .slot_manager
+            .run_systemctl_restart_no_block(&pending.systemd_unit)
+        {
+            tracing::error!(
+                deployment_id = %cmd.deployment_id,
+                unit = %pending.systemd_unit,
+                error = %err,
+                "Failed triggering detached rollback self-restart"
+            );
+        }
+    }
+
+    async fn wait_for_scenario_endpoints(
+        &self,
+        cmd: &SlotSwapCommand,
+        custom_tests: &[PlannedSandboxedTest],
+    ) {
+        if cmd.warmup_timeout_secs == 0 {
+            return;
+        }
+        let mut tcp_endpoints: Vec<(String, u16)> = Vec::new();
+        let mut unix_sockets: Vec<PathBuf> = Vec::new();
+        for planned in custom_tests {
+            for ep in extract_scenario_tcp_endpoints(&planned.sandbox_cfg.allowlisted_env) {
+                if !tcp_endpoints.contains(&ep) {
+                    tcp_endpoints.push(ep);
+                }
+            }
+            for sock in extract_scenario_unix_sockets(&planned.sandbox_cfg.allowlisted_env) {
+                if !unix_sockets.contains(&sock) {
+                    unix_sockets.push(sock);
+                }
+            }
+        }
+        let timeout = Duration::from_secs(cmd.warmup_timeout_secs);
+        if !tcp_endpoints.is_empty() {
+            if let Err(detail) =
+                wait_for_tcp_endpoints_ready(&tcp_endpoints, timeout, TCP_WARMUP_POLL_INTERVAL)
+                    .await
+            {
+                tracing::warn!(
+                    deployment_id = %cmd.deployment_id,
+                    service = %cmd.service_name,
+                    detail = %detail,
+                    "Warmup TCP readiness probe timed out; proceeding to sandboxed scenario probes"
+                );
+            }
+        }
+        if !unix_sockets.is_empty() {
+            if let Err(detail) =
+                wait_for_unix_sockets_ready(&unix_sockets, timeout, TCP_WARMUP_POLL_INTERVAL).await
+            {
+                tracing::warn!(
+                    deployment_id = %cmd.deployment_id,
+                    service = %cmd.service_name,
+                    detail = %detail,
+                    "Warmup Unix socket readiness probe timed out; proceeding to sandboxed scenario probes"
+                );
+            }
+        }
     }
 }
 
@@ -2024,6 +2954,7 @@ impl MuConDeAgent {
 mod tests {
     use super::*;
     use crate::btrfs::MockCommandRunner;
+    use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
     use crate::watchdog::MockHealthProber;
     use mu_cd_ipc::{
         ArtifactTaintNotification, DeploymentSlot, HealthProbeTelemetry, IntegrationTestReport,
@@ -3447,7 +4378,7 @@ allow_spacemit_ai_thread: false
         )
         .unwrap();
 
-        let service = "mu-cd-agent";
+        let service = "mu-ci-worker";
         let srv_dir = root.join(service);
         fs::create_dir_all(srv_dir.join("@a")).unwrap();
         fs::create_dir_all(srv_dir.join("@b")).unwrap();
@@ -4556,5 +5487,885 @@ allow_spacemit_ai_thread: false
 
         drop(client);
         let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_preflight_it_bundle_failure_does_not_swap_or_restart_live_service() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cas_dir).unwrap();
+
+        let service = "mu-registry";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root.clone(),
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        let agent = Arc::new(MuConDeAgent::new(
+            config,
+            runner.clone(),
+            Arc::new(MockHealthProber::new(true)),
+        ));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let missing_digest = "f".repeat(64);
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-preflight-no-bounce".into(),
+            lease_id: "lease-preflight".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "a".repeat(40),
+            it_archive_digest: Some(missing_digest),
+            bundle_id: None,
+            selected_tests: vec!["smoke_mu_registry".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_mu_registry".into(),
+                test_binary: "smoke_mu_registry".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cidrs: vec!["127.0.0.1/32".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let plan_bytes = fory.serialize(&plan).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 1),
+            &plan_bytes,
+        )
+        .await
+        .unwrap();
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-preflight-no-bounce".into(),
+            lease_id: "lease-preflight".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "muregist.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 2),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames_until(&mut client, 5, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                && fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+        let (_, rep_p) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+            .unwrap();
+        let report: IntegrationTestReport = fory.deserialize(rep_p).unwrap();
+        assert!(!report.passed);
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::A),
+            "live slot must remain untouched on pre-swap IT bundle fetch failure"
+        );
+        assert!(
+            !runner
+                .recorded_calls()
+                .iter()
+                .map(|c| c.join(" "))
+                .any(|c| c.contains("systemctl restart")),
+            "pre-swap failure must issue zero systemctl restart commands, got: {:?}",
+            runner.recorded_calls()
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_self_upgrade_pre_restart_corrupt_binary_rolls_back_under_100ms_without_restart() {
+        let temp = exec_tempdir();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cas_dir).unwrap();
+
+        let service = "mu-cd-agent";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a/bin")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b/bin")).unwrap();
+        fs::write(srv_dir.join("@a/bin/mu-cd-agent"), b"#!/bin/sh\nexit 0\n").unwrap();
+        // Corrupt / non-executable binary in @b/bin triggers immediate --version failure
+        fs::write(
+            srv_dir.join("@b/bin/mu-cd-agent"),
+            b"\x7fELFcorrupt-not-valid",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                srv_dir.join("@a/bin/mu-cd-agent"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            fs::set_permissions(
+                srv_dir.join("@b/bin/mu-cd-agent"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+        }
+
+        let (archive, it_digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"smoke_mu_cd_agent","command":"bin/smoke_mu_cd_agent","args":[],"critical":true,"timeout_secs":10}]}"#.as_slice(),
+                0o644,
+            ),
+            ("bin/smoke_mu_cd_agent", b"#!/bin/sh\nexit 0\n".as_slice(), 0o755),
+        ]);
+        write_cas_blob(&cas_dir, &it_digest, &archive);
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root.clone(),
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        let agent = Arc::new(MuConDeAgent::new(
+            config,
+            runner.clone(),
+            Arc::new(MockHealthProber::new(true)),
+        ));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-self-corrupt".into(),
+            lease_id: "lease-self-corrupt".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "b".repeat(40),
+            it_archive_digest: Some(it_digest),
+            bundle_id: None,
+            selected_tests: vec!["smoke_mu_cd_agent".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_mu_cd_agent".into(),
+                test_binary: "smoke_mu_cd_agent".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cidrs: vec!["127.0.0.1/32".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let plan_bytes = fory.serialize(&plan).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 1),
+            &plan_bytes,
+        )
+        .await
+        .unwrap();
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-self-corrupt".into(),
+            lease_id: "lease-self-corrupt".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "muconde-agent.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 2),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames_until(&mut client, 5, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                && fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+        let (_, rep_p) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+            .unwrap();
+        let report: IntegrationTestReport = fory.deserialize(rep_p).unwrap();
+        assert!(!report.passed);
+        assert!(report
+            .failed_tests
+            .contains(&"self_upgrade_binary_validation".to_string()));
+        assert!(
+            report.duration_ms < 100,
+            "pre-restart corrupt binary rollback must complete in <100ms, took {}ms",
+            report.duration_ms
+        );
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::A),
+            "corrupt self-upgrade candidate must roll back symlink immediately to @a"
+        );
+        assert!(!pending_self_upgrade_path(&root).exists());
+        assert!(
+            !runner
+                .recorded_calls()
+                .iter()
+                .map(|c| c.join(" "))
+                .any(|c| c.contains("systemctl restart")),
+            "corrupt self-upgrade binary must abort self-restart"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_self_upgrade_pass_and_post_restart_reconnect_handoff() {
+        use crate::sandbox_it::SandboxedExecutionOutput;
+
+        struct PassingSelfUpgradeExecutor {
+            delay: Duration,
+        }
+        #[async_trait::async_trait]
+        impl SandboxedCommandExecutor for PassingSelfUpgradeExecutor {
+            async fn execute_in_sandbox(
+                &self,
+                test: &DiscoveredItTest,
+                work_dir: &Path,
+                sandbox_cfg: &ItSandboxConfig,
+                _service: &str,
+                _target_slot: Slot,
+                _timeout: Duration,
+            ) -> Result<SandboxedExecutionOutput, AgentError> {
+                let argv = vec![test.command_path.as_os_str().to_os_string()];
+                let (effective_policy, execution_plan) =
+                    build_it_sandbox_plan(work_dir, &argv, sandbox_cfg)?;
+                tokio::time::sleep(self.delay).await;
+                Ok(SandboxedExecutionOutput {
+                    passed: true,
+                    exit_code: Some(0),
+                    duration_ms: 10,
+                    log_output: "smoke_mu_cd_agent ok".into(),
+                    effective_policy,
+                    execution_plan,
+                })
+            }
+        }
+
+        let temp = exec_tempdir();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cas_dir).unwrap();
+
+        let service = "mu-cd-agent";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a/bin")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b/bin")).unwrap();
+        fs::write(
+            srv_dir.join("@a/bin/mu-cd-agent"),
+            b"#!/bin/sh\necho mu-cd-agent 0.1.0\n",
+        )
+        .unwrap();
+        fs::write(
+            srv_dir.join("@b/bin/mu-cd-agent"),
+            b"#!/bin/sh\necho mu-cd-agent 0.2.0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                srv_dir.join("@a/bin/mu-cd-agent"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            fs::set_permissions(
+                srv_dir.join("@b/bin/mu-cd-agent"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+        }
+
+        let (archive, it_digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"smoke_mu_cd_agent","command":"bin/smoke_mu_cd_agent","args":[],"critical":true,"timeout_secs":10}]}"#.as_slice(),
+                0o644,
+            ),
+            ("bin/smoke_mu_cd_agent", b"#!/bin/sh\nexit 0\n".as_slice(), 0o755),
+        ]);
+        write_cas_blob(&cas_dir, &it_digest, &archive);
+
+        // Phase 1: Old agent validates --version, persists 0600 .pending_self_upgrade.json,
+        // runs systemctl restart --no-block, and closes stream cleanly.
+        let runner1 = Arc::new(MockCommandRunner::new(true));
+        let config1 = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root.clone(),
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir.clone()),
+            ..Default::default()
+        };
+        let old_agent = Arc::new(MuConDeAgent::new(
+            config1,
+            runner1.clone(),
+            Arc::new(MockHealthProber::new(true)),
+        ));
+
+        let (mut client1, server1) = tokio::io::duplex(64 * 1024);
+        let old_task = tokio::spawn(async move {
+            old_agent.handle_connection(server1).await.unwrap();
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-self-pass".into(),
+            lease_id: "lease-self-pass".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "c".repeat(40),
+            it_archive_digest: Some(it_digest),
+            bundle_id: None,
+            selected_tests: vec!["smoke_mu_cd_agent".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_mu_cd_agent".into(),
+                test_binary: "smoke_mu_cd_agent".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cidrs: vec!["127.0.0.1/32".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let plan_bytes = fory.serialize(&plan).unwrap();
+        write_frame(
+            &mut client1,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 1),
+            &plan_bytes,
+        )
+        .await
+        .unwrap();
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-self-pass".into(),
+            lease_id: "lease-self-pass".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "muconde-agent.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client1,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 2),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        // Drain ack until EOF caused by clean self-restart stream close
+        let phase1_frames = read_frames_until(&mut client1, 3, |_| false).await;
+        assert!(
+            !phase1_frames.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT),
+            "Phase 1 self-upgrade pre-restart --version check unexpectedly failed: {phase1_frames:?}"
+        );
+        drop(client1);
+        tokio::time::timeout(Duration::from_secs(5), old_task)
+            .await
+            .expect("timed out waiting for Phase 1 self-upgrade handler to close stream")
+            .unwrap();
+
+        let handoff_path = pending_self_upgrade_path(&root);
+        assert!(handoff_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&handoff_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, ".pending_self_upgrade.json must be 0600");
+        }
+        assert!(runner1
+            .recorded_calls()
+            .iter()
+            .map(|c| c.join(" "))
+            .any(|c| c.starts_with("systemctl restart --no-block ")));
+
+        // Phase 2: Fresh restarted agent claims .pending_self_upgrade.json, serves normal
+        // MSG_TYPE_HEARTBEAT RPC without consuming undelivered_report, and delivers the final
+        // passing IntegrationTestReport to the silent reconnecting controller.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let runner2 = Arc::new(MockCommandRunner::new(true));
+        let config2 = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root.clone(),
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        let new_agent = Arc::new(
+            MuConDeAgent::new(config2, runner2, Arc::new(MockHealthProber::new(true)))
+                .with_it_executor(Arc::new(PassingSelfUpgradeExecutor {
+                    delay: Duration::from_millis(220),
+                })),
+        );
+        let server_agent = new_agent.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = server_agent.run_with_listener(listener).await;
+        });
+
+        // Probe heartbeat RPC immediately while post-restart gate is running (< 150ms):
+        // must succeed normally and NOT consume undelivered_report.
+        let mut hb_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let hb_hdr = IpcHeader::new(MSG_TYPE_HEARTBEAT, 0, 0, 99);
+        write_frame(&mut hb_stream, &hb_hdr, &[]).await.unwrap();
+        let (hb_resp_hdr, _) =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut hb_stream))
+                .await
+                .expect("timed out waiting for heartbeat response")
+                .unwrap();
+        assert_eq!(hb_resp_hdr.msg_type, MSG_TYPE_HEARTBEAT);
+        drop(hb_stream);
+
+        // Silent reconnecting controller connects and awaits MSG_TYPE_IT_REPORT.
+        let mut ctrl_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (rep_hdr, rep_payload) =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut ctrl_stream))
+                .await
+                .expect("timed out waiting for self-upgrade report")
+                .unwrap();
+        assert_eq!(rep_hdr.msg_type, MSG_TYPE_IT_REPORT);
+        let report: IntegrationTestReport = fory.deserialize(&rep_payload).unwrap();
+        assert!(report.passed);
+        assert_eq!(report.deployment_id, "dep-self-pass");
+        assert!(
+            !handoff_path.exists(),
+            "handoff file must be claimed/removed"
+        );
+        assert_eq!(
+            new_agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::B)
+        );
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_self_upgrade_post_restart_gate_failure_restores_slot_delivers_report_and_restarts(
+    ) {
+        use crate::sandbox_it::SandboxedExecutionOutput;
+
+        struct FailingSelfUpgradeExecutor;
+        #[async_trait::async_trait]
+        impl SandboxedCommandExecutor for FailingSelfUpgradeExecutor {
+            async fn execute_in_sandbox(
+                &self,
+                test: &DiscoveredItTest,
+                work_dir: &Path,
+                sandbox_cfg: &ItSandboxConfig,
+                _service: &str,
+                _target_slot: Slot,
+                _timeout: Duration,
+            ) -> Result<SandboxedExecutionOutput, AgentError> {
+                let argv = vec![test.command_path.as_os_str().to_os_string()];
+                let (effective_policy, execution_plan) =
+                    build_it_sandbox_plan(work_dir, &argv, sandbox_cfg)?;
+                Ok(SandboxedExecutionOutput {
+                    passed: false,
+                    exit_code: Some(1),
+                    duration_ms: 15,
+                    log_output: "smoke_mu_cd_agent failed check".into(),
+                    effective_policy,
+                    execution_plan,
+                })
+            }
+        }
+
+        let temp = exec_tempdir();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cas_dir).unwrap();
+
+        let service = "mu-cd-agent";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        fs::write(srv_dir.join("@a/mu-cd-agent"), b"prev-bin").unwrap();
+        fs::write(srv_dir.join("@b/mu-cd-agent"), b"cand-bin").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("@b", srv_dir.join("current")).unwrap();
+
+        let (archive, it_digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"smoke_mu_cd_agent","command":"bin/smoke_mu_cd_agent","args":[],"critical":true,"timeout_secs":10}]}"#.as_slice(),
+                0o644,
+            ),
+            ("bin/smoke_mu_cd_agent", b"#!/bin/sh\nexit 1\n".as_slice(), 0o755),
+        ]);
+        write_cas_blob(&cas_dir, &it_digest, &archive);
+
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-self-fail-post".into(),
+            lease_id: "lease-self-fail-post".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "d".repeat(40),
+            it_archive_digest: Some(it_digest),
+            bundle_id: None,
+            selected_tests: vec!["smoke_mu_cd_agent".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_mu_cd_agent".into(),
+                test_binary: "smoke_mu_cd_agent".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cidrs: vec!["127.0.0.1/32".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let pending = PendingSelfUpgrade {
+            deployment_id: "dep-self-fail-post".into(),
+            lease_id: "lease-self-fail-post".into(),
+            service_name: service.into(),
+            from_slot: "@a".into(),
+            to_slot: "@b".into(),
+            candidate_sha256: "e".repeat(64),
+            systemd_unit: "muconde-agent.service".into(),
+            warmup_timeout_secs: 5,
+            scenario_plan: Some(SerializableScenarioPlan::from(&plan)),
+            deployment_config: None,
+            rollback_deployment: None,
+            created_epoch_ms: now_epoch_ms(),
+        };
+        write_pending_self_upgrade_atomic(&pending_self_upgrade_path(&root), &pending).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root.clone(),
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        let agent = Arc::new(
+            MuConDeAgent::new(
+                config,
+                runner.clone(),
+                Arc::new(MockHealthProber::new(true)),
+            )
+            .with_it_executor(Arc::new(FailingSelfUpgradeExecutor))
+            .with_self_upgrade_failure_window(Duration::from_millis(250)),
+        );
+        let server_agent = agent.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = server_agent.run_with_listener(listener).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let mut ctrl_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (rep_hdr, rep_payload) =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut ctrl_stream))
+                .await
+                .expect("timed out waiting for failed self-upgrade report")
+                .unwrap();
+        assert_eq!(rep_hdr.msg_type, MSG_TYPE_IT_REPORT);
+        let report: IntegrationTestReport = fory.deserialize(&rep_payload).unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.deployment_id, "dep-self-fail-post");
+        assert!(report
+            .failed_tests
+            .contains(&"smoke_mu_cd_agent".to_string()));
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::A),
+            "post-restart failure must restore @a"
+        );
+
+        // Wait for brief delivery window to trigger detached rollback restart
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            runner
+                .recorded_calls()
+                .iter()
+                .map(|c| c.join(" "))
+                .any(|c| c == "systemctl restart --no-block muconde-agent.service"),
+            "expected detached rollback self-restart, got: {:?}",
+            runner.recorded_calls()
+        );
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_controller_disconnect_caches_undelivered_report_for_reconnect() {
+        use crate::sandbox_it::SandboxedExecutionOutput;
+
+        struct DelayedPassExecutor;
+        #[async_trait::async_trait]
+        impl SandboxedCommandExecutor for DelayedPassExecutor {
+            async fn execute_in_sandbox(
+                &self,
+                test: &DiscoveredItTest,
+                work_dir: &Path,
+                sandbox_cfg: &ItSandboxConfig,
+                _service: &str,
+                _target_slot: Slot,
+                _timeout: Duration,
+            ) -> Result<SandboxedExecutionOutput, AgentError> {
+                let argv = vec![test.command_path.as_os_str().to_os_string()];
+                let (effective_policy, execution_plan) =
+                    build_it_sandbox_plan(work_dir, &argv, sandbox_cfg)?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(SandboxedExecutionOutput {
+                    passed: true,
+                    exit_code: Some(0),
+                    duration_ms: 20,
+                    log_output: "smoke_mu_cd_controller ok".into(),
+                    effective_policy,
+                    execution_plan,
+                })
+            }
+        }
+
+        let temp = exec_tempdir();
+        let root = temp.path().join("muconde");
+        let cas_dir = temp.path().join("cas");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cas_dir).unwrap();
+
+        let service = "mu-cd-controller";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+
+        let (archive, it_digest) = build_test_tar_gz(&[
+            (
+                "manifest.json",
+                br#"{"tests":[{"name":"smoke_mu_cd_controller","command":"bin/smoke_mu_cd_controller","args":[],"critical":true,"timeout_secs":10}]}"#.as_slice(),
+                0o644,
+            ),
+            ("bin/smoke_mu_cd_controller", b"#!/bin/sh\nexit 0\n".as_slice(), 0o755),
+        ]);
+        write_cas_blob(&cas_dir, &it_digest, &archive);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root.clone(),
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            cas_blobs_dir: Some(cas_dir),
+            ..Default::default()
+        };
+        let agent = Arc::new(
+            MuConDeAgent::new(
+                config,
+                Arc::new(MockCommandRunner::new(true)),
+                Arc::new(MockHealthProber::new(true)),
+            )
+            .with_it_executor(Arc::new(DelayedPassExecutor)),
+        );
+        let server_agent = agent.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = server_agent.run_with_listener(listener).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let mut conn1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-ctrl-self-1".into(),
+            lease_id: "lease-ctrl-self-1".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "f".repeat(40),
+            it_archive_digest: Some(it_digest),
+            bundle_id: None,
+            selected_tests: vec!["smoke_mu_cd_controller".into()],
+            scenarios: vec![ScenarioTestSpec {
+                name: "smoke_mu_cd_controller".into(),
+                test_binary: "smoke_mu_cd_controller".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cidrs: vec!["127.0.0.1/32".into()],
+                ro_mounts: Vec::new(),
+                critical: true,
+                timeout_secs: 10,
+            }],
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let plan_bytes = fory.serialize(&plan).unwrap();
+        write_frame(
+            &mut conn1,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 1),
+            &plan_bytes,
+        )
+        .await
+        .unwrap();
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-ctrl-self-1".into(),
+            lease_id: "lease-ctrl-self-1".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "muconde-controller.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut conn1,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 2),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+        // Read scenario ack then drop connection to simulate mu-cd-controller restarting mid-gate
+        let (ack_hdr, _) = read_frame(&mut conn1).await.unwrap();
+        assert_eq!(ack_hdr.msg_type, MSG_TYPE_SCENARIO_PLAN_ACK);
+        drop(conn1);
+
+        // Wait for delayed test to finish and cache the undelivered report
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // Reconnecting restarted controller opens fresh silent stream and receives cached report
+        let mut conn2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (rep_hdr, rep_payload) =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut conn2))
+                .await
+                .expect("timed out waiting for cached report on reconnect")
+                .unwrap();
+        assert_eq!(rep_hdr.msg_type, MSG_TYPE_IT_REPORT);
+        let report: IntegrationTestReport = fory.deserialize(&rep_payload).unwrap();
+        assert!(report.passed);
+        assert_eq!(report.deployment_id, "dep-ctrl-self-1");
+
+        // Second cycle: restarted controller reconnects EARLY (while delayed gate is STILL running),
+        // exercising `undelivered_report_notify` wakeup without deadlock.
+        let mut conn3 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut plan2 = plan.clone();
+        plan2.deployment_id = "dep-ctrl-self-early".into();
+        plan2.lease_id = "lease-ctrl-self-early".into();
+        let plan2_bytes = fory.serialize(&plan2).unwrap();
+        write_frame(
+            &mut conn3,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan2_bytes.len() as u32, 0, 1),
+            &plan2_bytes,
+        )
+        .await
+        .unwrap();
+        let mut swap2 = swap_cmd.clone();
+        swap2.deployment_id = "dep-ctrl-self-early".into();
+        swap2.lease_id = "lease-ctrl-self-early".into();
+        let swap2_bytes = fory.serialize(&swap2).unwrap();
+        write_frame(
+            &mut conn3,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap2_bytes.len() as u32, 0, 2),
+            &swap2_bytes,
+        )
+        .await
+        .unwrap();
+        let (ack2_hdr, _) = read_frame(&mut conn3).await.unwrap();
+        assert_eq!(ack2_hdr.msg_type, MSG_TYPE_SCENARIO_PLAN_ACK);
+        drop(conn3);
+
+        // Immediately connect BEFORE DelayedPassExecutor's 200ms sleep completes
+        let mut conn4 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (rep2_hdr, rep2_payload) =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut conn4))
+                .await
+                .expect("timed out waiting for early-reconnect cached report")
+                .unwrap();
+        assert_eq!(rep2_hdr.msg_type, MSG_TYPE_IT_REPORT);
+        let report2: IntegrationTestReport = fory.deserialize(&rep2_payload).unwrap();
+        assert!(report2.passed);
+        assert_eq!(report2.deployment_id, "dep-ctrl-self-early");
+
+        server_task.abort();
     }
 }
