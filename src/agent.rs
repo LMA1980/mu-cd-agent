@@ -2954,7 +2954,7 @@ impl MuConDeAgent {
 mod tests {
     use super::*;
     use crate::btrfs::MockCommandRunner;
-    use crate::sandbox_it::tests::build_test_tar_gz;
+    use crate::sandbox_it::tests::{build_test_tar_gz, exec_tempdir};
     use crate::watchdog::MockHealthProber;
     use mu_cd_ipc::{
         ArtifactTaintNotification, DeploymentSlot, HealthProbeTelemetry, IntegrationTestReport,
@@ -5614,7 +5614,7 @@ allow_spacemit_ai_thread: false
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_self_upgrade_pre_restart_corrupt_binary_rolls_back_under_100ms_without_restart() {
-        let temp = tempdir().unwrap();
+        let temp = exec_tempdir();
         let root = temp.path().join("muconde");
         let cas_dir = temp.path().join("cas");
         fs::create_dir_all(&root).unwrap();
@@ -5804,7 +5804,7 @@ allow_spacemit_ai_thread: false
             }
         }
 
-        let temp = tempdir().unwrap();
+        let temp = exec_tempdir();
         let root = temp.path().join("muconde");
         let cas_dir = temp.path().join("cas");
         fs::create_dir_all(&root).unwrap();
@@ -5927,8 +5927,16 @@ allow_spacemit_ai_thread: false
         .unwrap();
 
         // Drain ack until EOF caused by clean self-restart stream close
-        let _ = read_frames_until(&mut client1, 3, |_| false).await;
-        old_task.await.unwrap();
+        let phase1_frames = read_frames_until(&mut client1, 3, |_| false).await;
+        assert!(
+            !phase1_frames.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT),
+            "Phase 1 self-upgrade pre-restart --version check unexpectedly failed: {phase1_frames:?}"
+        );
+        drop(client1);
+        tokio::time::timeout(Duration::from_secs(5), old_task)
+            .await
+            .expect("timed out waiting for Phase 1 self-upgrade handler to close stream")
+            .unwrap();
 
         let handoff_path = pending_self_upgrade_path(&root);
         assert!(handoff_path.is_file());
@@ -5974,7 +5982,11 @@ allow_spacemit_ai_thread: false
         let mut hb_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let hb_hdr = IpcHeader::new(MSG_TYPE_HEARTBEAT, 0, 0, 99);
         write_frame(&mut hb_stream, &hb_hdr, &[]).await.unwrap();
-        let (hb_resp_hdr, _) = read_frame(&mut hb_stream).await.unwrap();
+        let (hb_resp_hdr, _) =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut hb_stream))
+                .await
+                .expect("timed out waiting for heartbeat response")
+                .unwrap();
         assert_eq!(hb_resp_hdr.msg_type, MSG_TYPE_HEARTBEAT);
         drop(hb_stream);
 
@@ -6033,7 +6045,7 @@ allow_spacemit_ai_thread: false
             }
         }
 
-        let temp = tempdir().unwrap();
+        let temp = exec_tempdir();
         let root = temp.path().join("muconde");
         let cas_dir = temp.path().join("cas");
         fs::create_dir_all(&root).unwrap();
@@ -6193,7 +6205,7 @@ allow_spacemit_ai_thread: false
             }
         }
 
-        let temp = tempdir().unwrap();
+        let temp = exec_tempdir();
         let root = temp.path().join("muconde");
         let cas_dir = temp.path().join("cas");
         fs::create_dir_all(&root).unwrap();
