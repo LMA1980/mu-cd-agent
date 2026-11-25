@@ -228,6 +228,7 @@ fn build_agent_config_with(
         registry_token,
         cas_blobs_dir,
         it_sandbox,
+        require_scenario_plan: true,
     })
 }
 
@@ -388,6 +389,7 @@ mod tests {
         assert_eq!(cfg.it_archive_digest, Some("a".repeat(64)));
         assert_eq!(cfg.it_bundle_id.as_deref(), Some("bundle-new"));
         assert_eq!(cfg.collector_addr.as_deref(), Some("127.0.0.1:4319"));
+        assert!(cfg.require_scenario_plan);
 
         // 2. Legacy MUCONDE_* / MUOBSERVE_* still accepted when MU_CD_* absent
         let legacy = HashMap::from([

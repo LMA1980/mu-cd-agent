@@ -84,6 +84,9 @@ pub struct MuConDeAgentConfig {
     pub cas_blobs_dir: Option<PathBuf>,
     /// `MuIsolation::KernelSandbox` constraints enforced for IT execution (`max_pids: 256`).
     pub it_sandbox: ItSandboxConfig,
+    /// Require an accepted `ScenarioExecutionPlan` (`0x0D`) before `MSG_TYPE_SLOT_SWAP` (`0x06`).
+    /// Production mode enforces `true` (fail closed without mutating `@a`/`@b` slots).
+    pub require_scenario_plan: bool,
 }
 
 impl Default for MuConDeAgentConfig {
@@ -111,6 +114,7 @@ impl Default for MuConDeAgentConfig {
             registry_token: None,
             cas_blobs_dir: None,
             it_sandbox: ItSandboxConfig::default(),
+            require_scenario_plan: true,
         }
     }
 }
@@ -1809,6 +1813,12 @@ impl MuConDeAgent {
                 ab_rules.auto_rollback_on_critical = plan.auto_rollback_on_critical;
                 Ok((gate_tests, planned_tests, unpack_guard, ab_rules))
             }
+            None if self.config.require_scenario_plan => {
+                Err(AgentError::SandboxViolation(format!(
+                    "ScenarioExecutionPlan required in zero-trust mode for deployment '{}' (service '{}')",
+                    cmd.deployment_id, cmd.service_name
+                )))
+            }
             None => {
                 let mut unpack_guard = None;
                 let mut unpacked_bundle = None;
@@ -3040,6 +3050,7 @@ mod tests {
             node_id: "node-test-swap".into(),
             muconde_root: root.clone(),
             required_consecutive_successes: 2,
+            require_scenario_plan: false,
             ..Default::default()
         };
 
@@ -3213,6 +3224,7 @@ mod tests {
             node_id: "node-gate".into(),
             muconde_root: temp.path().join("muconde"),
             required_consecutive_successes: 2,
+            require_scenario_plan: false,
             ..Default::default()
         };
         let frames = run_swap_and_collect(
@@ -3267,6 +3279,7 @@ mod tests {
         let config = MuConDeAgentConfig {
             node_id: "node-gate-fail".into(),
             muconde_root: temp.path().join("muconde"),
+            require_scenario_plan: false,
             ..Default::default()
         };
         // systemd unit up, health endpoint down.
@@ -3326,6 +3339,7 @@ mod tests {
             integration_tests: IntegrationTestSelection::Selected(vec![
                 TEST_HEALTH_ENDPOINT_READY.into()
             ]),
+            require_scenario_plan: false,
             ..Default::default()
         };
         let frames = run_swap_and_collect(
@@ -3492,6 +3506,7 @@ mod tests {
             node_id: "worker-riscv64".into(),
             muconde_root: root.clone(),
             required_consecutive_successes: 2,
+            require_scenario_plan: false,
             ..Default::default()
         };
 
@@ -3650,6 +3665,7 @@ mod tests {
             ]),
             it_archive_digest: Some(digest),
             cas_blobs_dir: Some(cas_dir),
+            require_scenario_plan: false,
             ..Default::default()
         };
         assert_eq!(config.it_sandbox.max_pids, 256);
@@ -3792,6 +3808,7 @@ mod tests {
             ]),
             it_archive_digest: Some(digest),
             cas_blobs_dir: Some(cas_dir),
+            require_scenario_plan: false,
             ..Default::default()
         };
 
@@ -3923,6 +3940,7 @@ mod tests {
                 ]),
                 it_archive_digest: Some(digest),
                 cas_blobs_dir: Some(cas_dir),
+                require_scenario_plan: false,
                 ..Default::default()
             };
             let agent = Arc::new(MuConDeAgent::new(
@@ -4008,6 +4026,7 @@ mod tests {
                 ]),
                 it_archive_digest: Some(expected_digest),
                 cas_blobs_dir: Some(cas_dir),
+                require_scenario_plan: false,
                 ..Default::default()
             };
             let agent = Arc::new(MuConDeAgent::new(
@@ -4186,6 +4205,7 @@ mod tests {
                 muconde_root: root,
                 default_warmup_timeout_secs: 5,
                 required_consecutive_successes: 2,
+                require_scenario_plan: false,
                 ..Default::default()
             },
             runner.clone(),
@@ -6367,5 +6387,209 @@ allow_spacemit_ai_thread: false
         assert_eq!(report2.deployment_id, "dep-ctrl-self-early");
 
         server_task.abort();
+    }
+
+    #[test]
+    fn test_config_defaults_require_scenario_plan_true() {
+        assert!(MuConDeAgentConfig::default().require_scenario_plan);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_slot_swap_without_scenario_plan_fails_closed_preserving_slots_and_units() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let service = "action-runner";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+
+        let config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root,
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            ..Default::default()
+        };
+        assert!(config.require_scenario_plan);
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let prober = Arc::new(MockHealthProber::new(true));
+        let agent = Arc::new(MuConDeAgent::new(config, runner.clone(), prober));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-no-plan-1".into(),
+            lease_id: "lease-no-plan-1".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: format!("{service}.service"),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 1),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames_until(&mut client, 5, |fs| {
+            fs.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+                && fs.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+
+        let (_, rep_p) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_IT_REPORT)
+            .expect("IntegrationTestReport must be emitted on missing ScenarioExecutionPlan");
+        let report: IntegrationTestReport = fory.deserialize(rep_p).unwrap();
+        assert!(!report.passed);
+        assert!(report
+            .log_excerpt
+            .as_deref()
+            .unwrap_or("")
+            .contains("ScenarioExecutionPlan required"));
+
+        let (_, taint_p) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+            .expect("ArtifactTaintNotification must be emitted on missing ScenarioExecutionPlan");
+        let taint: ArtifactTaintNotification = fory.deserialize(taint_p).unwrap();
+        assert!(taint.rollback_completed);
+
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::A),
+            "active slot must remain untouched when ScenarioExecutionPlan is missing"
+        );
+        assert!(
+            runner.recorded_calls().is_empty(),
+            "zero systemctl or Btrfs commands may run when ScenarioExecutionPlan is missing"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_slot_swap_after_accepted_scenario_plan_succeeds_with_require_scenario_plan_true()
+    {
+        use mu_cd_ipc::{ScenarioPlanAck, TestState};
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let service = "action-runner";
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        std::os::unix::fs::symlink("@a", srv_dir.join("current")).unwrap();
+
+        let config = MuConDeAgentConfig {
+            node_id: "node-a".into(),
+            muconde_root: root,
+            default_warmup_timeout_secs: 5,
+            required_consecutive_successes: 1,
+            ..Default::default()
+        };
+        assert!(config.require_scenario_plan);
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let prober = Arc::new(MockHealthProber::new(true));
+        let agent = Arc::new(MuConDeAgent::new(config, runner, prober));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let plan = ScenarioExecutionPlan {
+            deployment_id: "dep-with-plan-1".into(),
+            lease_id: "lease-with-plan-1".into(),
+            service_name: service.into(),
+            node_id: "node-a".into(),
+            policy_commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            it_archive_digest: None,
+            bundle_id: None,
+            selected_tests: vec!["systemd_unit_active".into(), "health_endpoint_ready".into()],
+            scenarios: Vec::new(),
+            env: Vec::new(),
+            args: Vec::new(),
+            cidrs: Vec::new(),
+            ro_mounts: Vec::new(),
+            max_pids: 256,
+            max_memlock_kb: 65_536,
+            auto_rollback_on_critical: true,
+        };
+        let plan_bytes = fory.serialize(&plan).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SCENARIO_PLAN, plan_bytes.len() as u32, 0, 1),
+            &plan_bytes,
+        )
+        .await
+        .unwrap();
+
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-with-plan-1".into(),
+            lease_id: "lease-with-plan-1".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: format!("{service}.service"),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        write_frame(
+            &mut client,
+            &IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 2),
+            &swap_bytes,
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames_until(&mut client, 5, |fs| {
+            progress_of(fs)
+                .iter()
+                .filter(|p| p.state == TestState::Passed)
+                .count()
+                >= 2
+        })
+        .await;
+
+        let (_, ack_p) = frames
+            .iter()
+            .find(|(t, _)| *t == MSG_TYPE_SCENARIO_PLAN_ACK)
+            .expect("ScenarioPlanAck must be emitted");
+        let ack: ScenarioPlanAck = fory.deserialize(ack_p).unwrap();
+        assert!(ack.accepted);
+        assert_eq!(
+            progress_of(&frames)
+                .iter()
+                .filter(|p| p.state == TestState::Passed)
+                .count(),
+            2
+        );
+        assert!(!frames.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT));
+        assert_eq!(
+            agent.slot_manager.read_active_slot(service).unwrap(),
+            Some(Slot::B)
+        );
+
+        drop(client);
+        let _ = agent_task.await;
     }
 }
